@@ -6,14 +6,50 @@ import { costFromUsage } from '@/lib/pricing/cost-from-usage';
 import { shortenClaudeModel } from './shorten-model';
 import type { ProviderAdapter, PricingResolution } from '../types';
 
+// ===== 自定义模型定价（cc-switch 代理的第三方模型）=====
+// 汇率：1 USD = 7.2 CNY
+// 注意：ccgauge 的 Pricing 单位是 USD per 1M tokens
+
+const CUSTOM_PRICING: Record<string, { input: number; output: number; cacheCreation5m: number; cacheCreation1h: number; cacheRead: number }> = {
+  'deepseek-v4-pro': {
+    input: 0.4167,
+    output: 0.8333,
+    cacheCreation5m: 0.4167,
+    cacheCreation1h: 0.4167,
+    cacheRead: 0.0035,
+  },
+  'deepseek-v4-flash': {
+    input: 0.1389,
+    output: 0.2778,
+    cacheCreation5m: 0.1389,
+    cacheCreation1h: 0.1389,
+    cacheRead: 0.0028,
+  },
+  'kimi-for-coding': {
+    input: 0, output: 0, cacheCreation5m: 0, cacheCreation1h: 0, cacheRead: 0,
+  },
+  'k2p6': {
+    input: 0, output: 0, cacheCreation5m: 0, cacheCreation1h: 0, cacheRead: 0,
+  },
+};
+
 const dateSuffix = /-\d{8}$/;
 const prefixRe = /^(vertex_ai|bedrock|anthropic)\//;
 
 function resolvePricing(model: string): PricingResolution {
   if (!model) return { pricing: null, matchType: 'none', matchedKey: null };
+  
+  // 1. 自定义模型精确匹配
+  if (CUSTOM_PRICING[model]) {
+    return { pricing: CUSTOM_PRICING[model], matchType: 'exact', matchedKey: model };
+  }
+  
+  // 2. 官方模型精确匹配
   if (BUILTIN_PRICING[model]) {
     return { pricing: BUILTIN_PRICING[model], matchType: 'exact', matchedKey: model };
   }
+  
+  // 3. 官方模型日期后缀剥离
   const stripped = model.replace(dateSuffix, '');
   if (BUILTIN_PRICING[stripped]) {
     return {
@@ -22,6 +58,8 @@ function resolvePricing(model: string): PricingResolution {
       matchedKey: stripped,
     };
   }
+  
+  // 4. 官方模型 provider 前缀剥离
   const noPrefix = stripped.replace(prefixRe, '');
   if (BUILTIN_PRICING[noPrefix]) {
     return {
@@ -30,6 +68,18 @@ function resolvePricing(model: string): PricingResolution {
       matchedKey: noPrefix,
     };
   }
+  
+  // 5. 自定义模型日期后缀剥离（如 deepseek-v4-pro-20250521）
+  const customStripped = model.replace(dateSuffix, '');
+  if (CUSTOM_PRICING[customStripped]) {
+    return {
+      pricing: CUSTOM_PRICING[customStripped],
+      matchType: 'date-stripped',
+      matchedKey: customStripped,
+    };
+  }
+  
+  // 6. 官方模型 family fallback
   for (const family of ['opus', 'sonnet', 'haiku']) {
     if (model.toLowerCase().includes(family)) {
       return {
