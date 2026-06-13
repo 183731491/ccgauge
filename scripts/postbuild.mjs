@@ -70,10 +70,8 @@ const extraTargets = [
   // which is NOT in the base-server startup chain). We self-host fonts
   // via @fontsource/geist and use no `next/font`.
   { path: join(NEXT_DIST, 'server', 'capsize-font-metrics.json'), label: 'next/dist/server/capsize-font-metrics.json' },
-  // Babel transpiler bundles — App Router production runs on SWC; babel
-  // here is only used by `next/font` loaders / legacy transforms.
-  { path: join(NEXT_DIST, 'compiled', 'babel'), label: 'next/dist/compiled/babel' },
-  { path: join(NEXT_DIST, 'compiled', 'babel-packages'), label: 'next/dist/compiled/babel-packages' },
+  // Babel code-frame is required at startup by next-devtools error
+  // inspection (patch-error-inspect -> shared.js). Keep it.
   // `next/font` implementation — unused (see above).
   { path: join(NEXT_DIST, 'compiled', '@next', 'font'), label: 'next/dist/compiled/@next/font' },
 ];
