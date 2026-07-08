@@ -5,6 +5,279 @@ All notable changes to **ccgauge** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-06-18
+
+Fixes two stacking / clipping bugs on the usage page that made dropdowns
+appear behind or get cut off by surrounding content.
+
+### Fixed
+
+- **Filter dropdowns on /usage were painted under the KPI cards.** The
+  custom-range picker (and by extension the model / project filter dropdowns)
+  showed the calendar / option list dimly behind the body content instead
+  of on top. Root cause: `.dash-stagger > *` applies a transform animation,
+  which makes each direct child its own stacking context — the top bar and
+  the body end up as siblings with implicit z-auto, so DOM order wins and
+  the body covers the top bar's popovers. Lifted the PageShell top bar to
+  `relative z-20` so its popovers always win. Same fix benefits every
+  PageShell-based page (sessions / projects / models / settings / overview).
+- **Usage table "Columns" dropdown got clipped by its Section card** when
+  the table filtered down to ~0–2 rows: the card collapsed to ~200 px while
+  the dropdown is ~328 px tall, so the bottom row of column toggles became
+  unreachable. The panel is now portaled to `<body>` (mirroring HoverCard)
+  and pinned to the trigger's bounding rect via `useLayoutEffect`, with
+  scroll / resize listeners keeping it anchored. Click-outside detection
+  now checks both the trigger and the portaled panel.
+
+## [1.2.0] — 2026-06-17
+
+Two big themes: **Codex billing accuracy** is back in line with
+[ccusage](https://github.com/ccusage/ccusage) (the de-facto reference for
+multi-agent token accounting), and the **usage page no longer freezes** when
+you flip ranges or sources.
+
+On the billing side: Codex transcripts had three independent issues that
+combined to push numbers off by ~20% in either direction. Reasoning tokens
+were being double-counted at the output rate (output already includes them in
+Codex's raw payload — verified against real `~/.codex` rollouts: `input +
+output == total`), the fast / priority service tier was billed at the
+standard rate (it's 2× for most models, 2.5× for `gpt-5.5`), and the most
+commonly used model strings (`gpt-5.2-codex`, `gpt-5.2` — together >65% of
+local Codex requests on the maintainer's machine) had no entry in the price
+table and silently fell back to the priciest gpt-5.5 tier. Costs now match
+ccusage to the cent on identical data; on a high-volume Codex priority-tier
+session the corrected total came in 2.4× higher than before — entirely from
+adding the missing multiplier and pricing keys, not from new spend.
+
+On the usage page: every filter change re-streamed ~300 KB of HTML and
+fully re-hydrated a 25-row table with portal hovercards. Combined with no
+visible click feedback, this looked like the UI was frozen. The page is now
+a thin shell that boots in ~20 KB, and the chart / KPIs / table fetch from
+a new `/api/turns` endpoint with stale-while-revalidate caching. Toggling
+7d ↔ 30d ↔ all is now ~30 ms after the first hit (was ~150 ms every time),
+and every filter control flashes pending state on click so it's obvious
+the input landed.
+
+### Fixed
+
+- **Codex reasoning tokens were billed twice.** The parser added
+  `reasoning_output_tokens` on top of `output_tokens` before applying the
+  output rate, but Codex's raw payload already counts reasoning inside
+  `output_tokens` (every `total = input + output` invariant holds in real
+  rollouts). Output is now billed once; `reasoning_tokens` stays on the
+  record as a display-only subset, mirroring ccusage's
+  `reasoningOutputTokens` column. `parserVersion` bumps to
+  `codex-v6-output-excludes-readded-reasoning` so any indexed snapshot
+  rebuilds with the corrected totals.
+- **Fast / priority service tier was missing.** When
+  `~/.codex/config.toml` sets `service_tier = "fast" | "priority"`, costs
+  scale per model (gpt-5.5 ×2.5, others ×2, ported from ccusage's
+  `fast-multiplier-overrides.json`). Standard-tier sessions are unchanged.
+- **`gpt-5.2`, `gpt-5.2-codex`, `gpt-5.1`, `gpt-5.1-codex` had no pricing
+  rows** and resolved via family-fallback to the priciest gpt-5.5 tier
+  (5 / 30 per 1 M tokens). Real Codex logs use these strings constantly —
+  the maintainer's archive had ~1,600 requests on `gpt-5.2-codex` alone,
+  every one of which was over-billed by ~3×. Added with ccusage's values
+  (gpt-5.2-codex 1.75 / 14, gpt-5.1 1.25 / 10) so they resolve `exact`.
+
+### Added
+
+- **`·fast` marker on the usage page model column** when the active Codex
+  config requests the fast / priority tier. Shows as `GPT-5.5·fast` in
+  amber with a tooltip explaining the 2×+ rate, on Codex rows only.
+  Source-aware: Claude rows stay clean even on mixed (`source=all`) views.
+- **Build-time LiteLLM snapshot for builtin pricing.** New
+  `pnpm update-pricing` script fetches BerriAI/litellm's
+  `model_prices_and_context_window.json`, filters to Anthropic + OpenAI
+  chat models, transforms per-token costs into ccgauge's per-1 M
+  `Pricing` shape (Anthropic `cacheCreation1h = 2× input`, mirroring
+  ccusage's hard-coded multiplier; OpenAI keeps cache-write tiers at 0),
+  and writes a committed `lib/pricing/litellm-pricing.generated.{js,d.ts}`.
+  Runtime stays fully offline — the snapshot IS the pin. The hand-curated
+  layer shrinks to seven legacy Claude bare names that LiteLLM doesn't
+  carry; everything LiteLLM tracks is sourced from there.
+
+### Performance
+
+- **Usage page page-load HTML cut from ~300 KB to ~34 KB**, constant
+  across filters. `force-dynamic` SSR no longer re-streams every record
+  inline as RSC payload; the page now ships a shell only.
+- **Filter changes feed from a JSON endpoint with stale-while-revalidate.**
+  New `/api/turns` returns totals, trend buckets, the paginated turn
+  slice, and the filter dropdown contents (~30 KB). A client-side URL-keyed
+  cache renders the previous payload immediately on revisit, so 7d ↔ 30d
+  toggles drop from ~150 ms each to ~30 ms after the first hit.
+- **Every filter nav now uses `useTransition`** with visible pending
+  feedback (control opacity-60 + `cursor-progress` + `aria-busy`, table
+  card additionally drops pointer events). Range picker, segmented
+  picker, multi-selects, table sort / page / search, source switcher —
+  all share the treatment. Eliminates the "did my click land?" gap.
+- **Scan-derived data is cached on the indexer snapshot.**
+  `allModels` / `allProjects` use a WeakMap on the scan object; new
+  `recordsToTurnRowsCached` is an LRU sub-keyed on
+  `(source, range token, models, projects)`. Using the range *token*
+  instead of the resolved `fromIso/toIso` avoids `Date.now()` drift, so
+  the same scan + same filter combo hits the cache on every revisit.
+
+### Changed
+
+- **GPT-5 base variants (`gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-codex`)
+  now follow LiteLLM**: 1.25 / 10, 0.25 / 2, 0.05 / 0.4, 1.25 / 10
+  respectively (these are the same numbers ccusage uses). The 1.1.6
+  alignment chose openai.com values for them; this release picks one
+  source of truth for the whole table. No real-data impact for the
+  maintainer's transcripts — none of those four ids appears in local
+  Codex logs.
+- **`AutoRefresh` now dispatches a `ccgauge:refresh` window event** so the
+  client-side data island can re-fetch alongside the existing
+  `router.refresh()`. Existing pages without an island are unaffected.
+
+## [1.1.6] — 2026-06-17
+
+Brings GPT pricing back in line with [OpenAI's official rates](https://openai.com/api/pricing/)
+and trims the settings page model table to the variants people actually run today.
+
+### Fixed
+
+- **GPT-5 family prices were wrong across the board.** Every gpt-5\* entry was
+  carrying the old launch-window numbers (`$1.25 / $10` per 1 M tokens),
+  which under-reported cost on every Codex CLI session run since the
+  rate change. Updated to current official rates:
+  `gpt-5.5` $5 / $30 (cached $0.50), `gpt-5.4` $2.50 / $15 (cached $0.25),
+  and `gpt-5.3-codex` $1.75 / $14 (cached $0.175). The bare-name
+  Codex CLI aliases (`gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-codex`)
+  are mapped to the matching `gpt-5.4` tier so existing transcripts cost
+  out correctly without manual remapping.
+
+### Added
+
+- **`gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.3-codex`, `gpt-5-codex`** as
+  first-class pricing entries, so Codex CLI runs on those exact ids get
+  an `exact` match instead of falling through to family-fallback.
+
+### Changed
+
+- **Settings → Pricing table trimmed to the models in active use.**
+  Codex now shows `gpt-5*` only; the legacy `gpt-4.1`, `o3`, `o4-mini`
+  rows are hidden (their prices are still in the underlying table, so
+  any historical session involving them still costs out accurately).
+  Claude shows only `haiku-4-5`, `sonnet-4-6`, `opus-4-6` and newer,
+  plus the `fable-5` family — older snapshots are kept in the data for
+  the same backward-compat reason but no longer clutter the UI.
+
+### Removed
+
+- **`gpt-5.5-mini` and `gpt-5.5-nano` pricing rows.** These ids never
+  shipped on the OpenAI pricing page; they were placeholder rows from
+  the initial 5.5 announcement and would have masked real usage of the
+  `gpt-5.4-mini` / `gpt-5.4-nano` ids that do exist.
+
+## [1.1.5] — 2026-06-11
+
+Adds pricing support for Claude Fable 5 and fixes a turn-grouping regression
+where background-task completions appeared as dozens of standalone rows on the
+usage page instead of folding into the turn that spawned them.
+
+### Added
+
+- **Claude Fable 5 pricing.** Input $10 / output $50 per 1 M tokens, with
+  cache-write multipliers (5 min: ×1.25 → $12.50, 1 h: ×2 → $20) and cache
+  read at $1 per 1 M tokens. `fable` is now a recognized family-fallback key,
+  so future `claude-fable-*` variants resolve automatically without a code
+  change.
+
+### Fixed
+
+- **`<task-notification>` completions split into dozens of standalone rows.**
+  When a turn used the Workflow / ultracode tool to fan out background tasks,
+  each completion notification arrived as a harness-injected `user` message
+  and was incorrectly treated as a new turn root — producing one row per
+  background-task result instead of folding all the work back into the
+  spawning turn. `isSyntheticUserText` now classifies `<task-notification>`
+  messages as synthetic; a `parserVersion` bump (`claude-v5-task-notification-synthetic`)
+  invalidates the persisted index cache so existing transcripts are re-parsed
+  on first load.
+
+## [1.1.4] — 2026-06-07
+
+A maintenance follow-up to 1.1.3 — hardens the build's smoke gate and adds
+regression coverage for the Workflow badge. No user-facing or runtime
+changes.
+
+### Fixed
+
+- **Build smoke gate could spuriously fail or leak on interruption.** The
+  post-build `smoke-standalone.mjs` picked its port ~1s before binding it
+  (the standalone `cpSync` sits in between), so a busy host could grab the
+  port in that gap and fail the build with a spurious `EADDRINUSE`; and a
+  signal-killed run (CI cancel / Ctrl-C) skipped the cleanup, leaking the
+  multi-MB temp copy and an orphaned server still holding the port. The
+  gate now picks the port immediately before spawn and cleans up the temp
+  dir + child on SIGINT/SIGTERM/SIGHUP.
+
+### Internal
+
+- **Regression test for the Workflow badge count.** Added an N>1 fan-out
+  case to `scripts/test-sidechain.mjs`: three sub-agents (two Workflow
+  files + one Task) fold into a single turn, and the badge count resolves
+  to the two distinct workflow transcript files (the Task one excluded) —
+  the `workflowSubagentCount` path the 1.1.3 feature shipped without
+  coverage.
+
+## [1.1.3] — 2026-06-05
+
+A critical hotfix, plus a Workflow / ultracode badge on the usage page.
+**v1.1.2 fails to start on a clean install** — `npx ccgauge` crashes at
+boot, before serving a single page. If you installed 1.1.2, upgrade
+immediately.
+
+### Added
+
+- **Workflow / ultracode badge on the usage page.** A turn that fans out
+  parallel sub-agents — Claude Code's Workflow tool, e.g. `ultracode`
+  mode — now shows a `Workflow ×N` badge in the usage table's model
+  column, where N is the number of distinct parallel sub-agent transcripts
+  it spawned. Localized (en / zh).
+
+### Fixed
+
+- **`npx ccgauge` crashed on every clean machine (1.1.2 regression).**
+  The 1.1.2 size-prune deleted `next/dist/compiled/babel`, assuming it was
+  a build-only transpiler bundle. It is not: Next's standalone production
+  startup requires `babel/code-frame` unconditionally
+  (`node-environment.js` → `patch-error-inspect.js` →
+  `next-devtools/server/shared.js`). The server threw `Cannot find module
+  'next/dist/compiled/babel/code-frame'` at boot and never listened — so
+  every page, logo, and JS chunk failed to load with a 400 and the app
+  died with a `ChunkLoadError`. `babel` + `babel-packages` are restored to
+  the package (tarball 5.3 MB → 5.9 MB — still ~62% below the 15.5 MB it
+  started from). The other prunes (`sharp` / `@img`, AMP validator,
+  capsize font-metrics, `next/font`) are verified safe and stay removed.
+
+- **The build's smoke gate couldn't catch this — now it can.** The
+  post-build `smoke-standalone.mjs` booted the server *inside the repo*,
+  where Node's module resolution falls back to the project's own
+  `node_modules/next` — so a standalone missing its bundled `babel` still
+  started and the gate passed green. The gate now copies the standalone to
+  a temp dir **outside the repo** and boots it there, faithfully
+  reproducing a clean `npx` install. Reverse-tested: with `babel` removed
+  it now fails the build (`server exited early … Cannot find module`),
+  exactly the regression that shipped 1.1.2.
+
+- **Workflow / ultracode sub-agent turns weren't folded into the turn
+  that spawned them.** These sub-agent transcripts live under
+  `subagents/workflows/wf_<id>/`, a path the sidechain-linking regex
+  didn't match — so each parallel agent surfaced as its own orphan
+  "(no user text)" row instead of collapsing into the conversation turn
+  that launched the fan-out. The matcher now handles the nested workflow
+  path (case- and separator-tolerant), with regression tests.
+
+### Internal
+
+- `postbuild.mjs` now carries a standing warning against re-pruning
+  `babel`, documenting the exact startup require chain that depends on it,
+  so the assumption that misfired in 1.1.2 can't be repeated silently.
+
 ## [1.1.2] — 2026-05-30
 
 A packaging + polish release. The published npm tarball shrinks by 66%,
@@ -1263,6 +1536,11 @@ of HTML to the browser.
 - Initial public release as `ccgauge`: local Next.js dashboard for
   Claude Code token usage, cost, and 5-hour block tracking.
 
+[1.1.4]: https://github.com/chengzuopeng/ccgauge/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/chengzuopeng/ccgauge/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/chengzuopeng/ccgauge/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/chengzuopeng/ccgauge/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/chengzuopeng/ccgauge/compare/v1.0.5...v1.1.0
 [1.0.5]: https://github.com/chengzuopeng/ccgauge/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/chengzuopeng/ccgauge/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/chengzuopeng/ccgauge/compare/v1.0.2...v1.0.3

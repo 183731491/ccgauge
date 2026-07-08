@@ -1,7 +1,8 @@
 'use client';
 
-import { Fragment, useEffect, useRef, useState } from 'react';
-import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { usePathname, useSearchParams } from 'next/navigation';
 import {
   formatUSDPrecise,
   formatDateTime,
@@ -18,6 +19,7 @@ import type { Locale } from '@/lib/i18n/dict';
 import { HoverCard } from '@/components/hover-card';
 import { ScrollShadows } from '@/components/scroll-shadows';
 import type { SortKey } from '@/lib/usage-query';
+import { usePendingNav } from '@/lib/use-pending-nav';
 
 type ColumnId =
   | 'time'
@@ -95,20 +97,24 @@ interface UsageTableProps {
   pageCount: number;
   sort: { key: SortKey; dir: 'asc' | 'desc' };
   query: string;
+  /** Codex priority/fast service tier active → mark Codex models with ·fast. */
+  codexFastActive: boolean;
 }
 
-export function UsageTable({ rows, totalCount, page, pageCount, sort, query }: UsageTableProps) {
+export function UsageTable({ rows, totalCount, page, pageCount, sort, query, codexFastActive }: UsageTableProps) {
   const t = useT();
   const { locale } = useI18n();
-  const router = useRouter();
   const pathname = usePathname();
   const params = useSearchParams();
+  const { pending, navigate } = usePendingNav();
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [visible, setVisible] = useState<Record<ColumnId, boolean>>(defaultVisible);
   const [colsOpen, setColsOpen] = useState(false);
+  const [colsPos, setColsPos] = useState<{ top: number; right: number } | null>(null);
   const [queryInput, setQueryInput] = useState(query);
-  const colsRef = useRef<HTMLDivElement>(null);
+  const colsTriggerRef = useRef<HTMLButtonElement>(null);
+  const colsPanelRef = useRef<HTMLDivElement>(null);
   const queryDebounceRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -127,11 +133,39 @@ export function UsageTable({ rows, totalCount, page, pageCount, sort, query }: U
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
-      if (colsRef.current && !colsRef.current.contains(e.target as Node)) setColsOpen(false);
+      const target = e.target as Node;
+      // The panel is portaled to <body> so a contains() check against the
+      // trigger alone isn't enough — also exclude clicks inside the panel.
+      if (colsTriggerRef.current?.contains(target)) return;
+      if (colsPanelRef.current?.contains(target)) return;
+      setColsOpen(false);
     }
     document.addEventListener('mousedown', onClick);
     return () => document.removeEventListener('mousedown', onClick);
   }, []);
+
+  // Position the portaled panel under the trigger and keep it pinned as the
+  // user scrolls or resizes. `useLayoutEffect` so the panel appears in place
+  // on the first frame instead of flickering at (0, 0).
+  useLayoutEffect(() => {
+    if (!colsOpen) {
+      setColsPos(null);
+      return;
+    }
+    function place() {
+      const el = colsTriggerRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setColsPos({ top: r.bottom + 4, right: window.innerWidth - r.right });
+    }
+    place();
+    window.addEventListener('scroll', place, true);
+    window.addEventListener('resize', place);
+    return () => {
+      window.removeEventListener('scroll', place, true);
+      window.removeEventListener('resize', place);
+    };
+  }, [colsOpen]);
 
   useEffect(() => {
     return () => {
@@ -150,7 +184,7 @@ export function UsageTable({ rows, totalCount, page, pageCount, sort, query }: U
       else sp.set(k, v);
     }
     const qs = sp.toString();
-    router.push(qs ? `${pathname}?${qs}` : pathname);
+    navigate(qs ? `${pathname}?${qs}` : pathname);
   }
 
   function setQuery(q: string) {
@@ -206,51 +240,77 @@ export function UsageTable({ rows, totalCount, page, pageCount, sort, query }: U
           <span className="text-xs text-text-tertiary tabular-nums">
             {t('common.rows', { count: totalCount.toLocaleString() })}
           </span>
-          <div ref={colsRef} className="relative">
-            <button onClick={() => setColsOpen((o) => !o)} className="btn">
+          <div className="relative">
+            <button
+              ref={colsTriggerRef}
+              onClick={() => setColsOpen((o) => !o)}
+              className="btn"
+              aria-haspopup="dialog"
+              aria-expanded={colsOpen}
+            >
               {t('usage.columns.button')}
               <span className="ml-1 text-text-tertiary tabular-nums">{visibleCount}</span>
             </button>
-            {colsOpen && (
-              <div className="absolute right-0 mt-1 w-56 card border-border-hi shadow-lg p-2 z-30">
-                <div className="flex items-center justify-between px-1.5 pb-1.5 mb-1 border-b border-border">
-                  <span className="text-xs text-text-tertiary uppercase tracking-wide">
-                    {t('usage.columns.title')}
-                  </span>
-                  <button
-                    onClick={() => setVisible(defaultVisible())}
-                    className="text-xs text-text-tertiary hover:text-text-primary"
-                  >
-                    {t('usage.columns.reset')}
-                  </button>
-                </div>
-                <div className="max-h-72 overflow-auto">
-                  {COLUMNS.map((c) => (
-                    <label
-                      key={c.id}
-                      className="flex items-center gap-2 px-1.5 py-1.5 text-sm rounded hover:bg-bg-surface-hi cursor-pointer"
+            {/*
+              Portaled to <body> so the Section card's `overflow-hidden` can't
+              clip it when the table is short (e.g. filter yields ~0 rows).
+              `useLayoutEffect` keeps it pinned to the trigger as the user
+              scrolls or resizes.
+            */}
+            {colsOpen && colsPos &&
+              typeof document !== 'undefined' &&
+              createPortal(
+                <div
+                  ref={colsPanelRef}
+                  className="fixed w-56 card border-border-hi shadow-lg p-2 z-50"
+                  style={{ top: colsPos.top, right: colsPos.right }}
+                  role="dialog"
+                >
+                  <div className="flex items-center justify-between px-1.5 pb-1.5 mb-1 border-b border-border">
+                    <span className="text-xs text-text-tertiary uppercase tracking-wide">
+                      {t('usage.columns.title')}
+                    </span>
+                    <button
+                      onClick={() => setVisible(defaultVisible())}
+                      className="text-xs text-text-tertiary hover:text-text-primary"
                     >
-                      <input
-                        type="checkbox"
-                        checked={!!visible[c.id]}
-                        onChange={(e) =>
-                          setVisible((prev) => ({ ...prev, [c.id]: e.target.checked }))
-                        }
-                        className="accent-brand"
-                      />
-                      <span className="text-text-secondary">{t(c.labelKey)}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            )}
+                      {t('usage.columns.reset')}
+                    </button>
+                  </div>
+                  <div className="max-h-72 overflow-auto">
+                    {COLUMNS.map((c) => (
+                      <label
+                        key={c.id}
+                        className="flex items-center gap-2 px-1.5 py-1.5 text-sm rounded hover:bg-bg-surface-hi cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!visible[c.id]}
+                          onChange={(e) =>
+                            setVisible((prev) => ({ ...prev, [c.id]: e.target.checked }))
+                          }
+                          className="accent-brand"
+                        />
+                        <span className="text-text-secondary">{t(c.labelKey)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>,
+                document.body,
+              )}
           </div>
           <button onClick={exportCsv} className="btn">
             {t('common.exportCsv')}
           </button>
         </div>
       </div>
-      <div className="card overflow-hidden">
+      <div
+        className={cn(
+          'card overflow-hidden transition-opacity',
+          pending && 'opacity-60 cursor-progress pointer-events-none',
+        )}
+        aria-busy={pending}
+      >
         <ScrollShadows>
           <table className="w-full text-sm">
             <thead>
@@ -287,6 +347,7 @@ export function UsageTable({ rows, totalCount, page, pageCount, sort, query }: U
                     activeColumns={activeColumns}
                     locale={locale}
                     t={t}
+                    codexFastActive={codexFastActive}
                   />
                 );
               })}
@@ -349,6 +410,7 @@ function RowsForTurn({
   activeColumns,
   locale,
   t,
+  codexFastActive,
 }: {
   turn: UsageTurnRow;
   isOpen: boolean;
@@ -359,6 +421,7 @@ function RowsForTurn({
   activeColumns: ColumnDef[];
   locale: Locale;
   t: Translator;
+  codexFastActive: boolean;
 }) {
   const baseModel =
     turn.models.length === 1
@@ -391,7 +454,7 @@ function RowsForTurn({
             key={c.id}
             className={cn('px-3 py-2', c.align === 'right' ? 'text-right' : 'text-left')}
           >
-            {renderTurnCell(c.id, turn, modelLabel, toolsLabel, userText, locale, t)}
+            {renderTurnCell(c.id, turn, modelLabel, toolsLabel, userText, locale, t, codexFastActive)}
           </td>
         ))}
       </tr>
@@ -407,7 +470,7 @@ function RowsForTurn({
                 key={c.id}
                 className={cn('px-3 py-1.5', c.align === 'right' ? 'text-right' : 'text-left')}
               >
-                {renderChildCell(c.id, r, turn.userText, locale, t)}
+                {renderChildCell(c.id, r, turn.userText, locale, t, codexFastActive)}
               </td>
             ))}
           </tr>
@@ -424,6 +487,7 @@ function renderTurnCell(
   userText: string,
   locale: Locale,
   t: Translator,
+  codexFastActive: boolean,
 ): React.ReactNode {
   switch (id) {
     case 'time':
@@ -457,7 +521,30 @@ function renderTurnCell(
         </HoverCard>
       );
     case 'model':
-      return <span className="text-text-primary whitespace-nowrap">{modelLabel}</span>;
+      return (
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          <span className="text-text-primary">
+            {modelLabel}
+            {codexFastActive && turn.source === 'codex' && (
+              <span className="font-semibold text-warning" title={t('usage.badge.fastHint')}>
+                {`·${t('usage.badge.fast')}`}
+              </span>
+            )}
+          </span>
+          {turn.hasWorkflowSubagents && (
+            <span
+              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-semibold leading-none bg-brand/10 text-brand border border-brand/20"
+              title={t('usage.badge.workflowHint', { count: turn.workflowSubagentCount })}
+            >
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M13 2 3 14h7l-1 8 10-12h-7z" />
+              </svg>
+              {t('usage.badge.workflow')}
+              {turn.workflowSubagentCount > 1 ? ` ×${turn.workflowSubagentCount}` : ''}
+            </span>
+          )}
+        </span>
+      );
     case 'project':
       return (
         <span className="block text-text-secondary truncate max-w-[180px]" title={turn.cwd}>
@@ -531,6 +618,7 @@ function renderChildCell(
   turnPrompt: string,
   locale: Locale,
   t: Translator,
+  codexFastActive: boolean,
 ): React.ReactNode {
   switch (id) {
     case 'time':
@@ -574,6 +662,11 @@ function renderChildCell(
         <span className="whitespace-nowrap">
           {shortenModel(r.model)}
           {r.effort ? ` · ${r.effort}` : ''}
+          {codexFastActive && r.source === 'codex' && (
+            <span className="font-semibold text-warning" title={t('usage.badge.fastHint')}>
+              {`·${t('usage.badge.fast')}`}
+            </span>
+          )}
         </span>
       );
     case 'project':

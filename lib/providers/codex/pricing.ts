@@ -1,88 +1,24 @@
 import type { Pricing } from '@/lib/types';
 import type { PricingResolution } from '../types';
+// Relative + explicit .js so raw `node --experimental-strip-types` test runs resolve it.
+import { LITELLM_OPENAI_PRICING } from '../../pricing/litellm-pricing.generated.js';
+
+/**
+ * Hand-maintained OpenAI/Codex pricing for models LiteLLM's table does NOT
+ * carry. LiteLLM currently covers every model ccgauge tracks, so this is empty;
+ * it's the documented home for any future bleeding-edge model LiteLLM hasn't
+ * indexed yet. LiteLLM wins for shared keys (snapshot spread LAST). Refresh the
+ * snapshot with `pnpm update-pricing`.
+ */
+const HAND_OPENAI: Record<string, Pricing> = {};
 
 export const BUILTIN_PRICING_OPENAI: Record<string, Pricing> = {
-  'gpt-5': {
-    input: 1.25,
-    output: 10,
-    cacheRead: 0.13,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5-mini': {
-    input: 0.25,
-    output: 2,
-    cacheRead: 0.025,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5-nano': {
-    input: 0.05,
-    output: 0.4,
-    cacheRead: 0.005,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5.4': {
-    input: 1.25,
-    output: 10,
-    cacheRead: 0.13,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5.5': {
-    input: 1.25,
-    output: 10,
-    cacheRead: 0.13,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5.5-mini': {
-    input: 0.25,
-    output: 2,
-    cacheRead: 0.025,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-5.5-nano': {
-    input: 0.05,
-    output: 0.4,
-    cacheRead: 0.005,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-4.1': {
-    input: 2,
-    output: 8,
-    cacheRead: 0.5,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'gpt-4.1-mini': {
-    input: 0.4,
-    output: 1.6,
-    cacheRead: 0.1,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'o3': {
-    input: 2,
-    output: 8,
-    cacheRead: 0.5,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
-  'o4-mini': {
-    input: 1.1,
-    output: 4.4,
-    cacheRead: 0.275,
-    cacheCreation5m: 0,
-    cacheCreation1h: 0,
-  },
+  ...HAND_OPENAI,
+  ...LITELLM_OPENAI_PRICING,
 };
 
 export const FALLBACK_FAMILY_OPENAI: Record<string, Pricing> = {
-  gpt: BUILTIN_PRICING_OPENAI['gpt-5'],
+  gpt: BUILTIN_PRICING_OPENAI['gpt-5.5'],
   o: BUILTIN_PRICING_OPENAI['o3'],
 };
 

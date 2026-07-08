@@ -80,7 +80,7 @@ function resolvePricing(model: string): PricingResolution {
   }
   
   // 6. 官方模型 family fallback
-  for (const family of ['opus', 'sonnet', 'haiku']) {
+  for (const family of ['fable', 'opus', 'sonnet', 'haiku']) {
     if (model.toLowerCase().includes(family)) {
       return {
         pricing: FALLBACK_BY_FAMILY[family],
@@ -114,7 +114,7 @@ export const claudeAdapter: ProviderAdapter = {
   color: { fg: '#b45309', bg: '#fef3c7' },
   logoSrc: '/claude-logo.webp',
 
-  parserVersion: 'claude-v4-sidechain-merge',
+  parserVersion: 'claude-v5-task-notification-synthetic',
   capabilities: {
     hasCacheCreation: true,
     hasReasoningTokens: false,
