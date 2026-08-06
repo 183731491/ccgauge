@@ -87,6 +87,11 @@ export type RawRecord = z.infer<typeof RawRecordSchema>;
 
 export type ProviderId = 'claude' | 'codex';
 
+export interface ToolUseRef {
+  id: string;
+  name: string;
+}
+
 export interface AssistantRecord {
   type: 'assistant';
   source: ProviderId;
@@ -107,6 +112,10 @@ export interface AssistantRecord {
     reasoning_tokens?: number;
   };
   toolNames: string[];
+  /** Per-turn tool_use id→name, used to attribute the size of the matching
+   *  tool_result (which lands on a later UserRecord) back to the tool that
+   *  produced it. Consumed by lib/aggregator/tools.ts. Claude only. */
+  toolUses?: ToolUseRef[];
   hasThinking: boolean;
   textPreview: string;
   filePath: string;
@@ -114,6 +123,11 @@ export interface AssistantRecord {
   effort?: string;
 
   isSidechain?: boolean;
+  /** Lineage root this sub-agent transcript belongs to — see the UserRecord
+   *  field. Needed on assistants too because a Codex sub-agent thread can
+   *  carry NO user record at all (its task prompt is a `response_item`, not a
+   *  `user_message`), leaving its assistants as the only thing to anchor. */
+  parentSessionId?: string;
   /** True when this record came from a Workflow (ultracode) sub-agent
    *  transcript — i.e. a file under `subagents/workflows/wf_.../`, as
    *  opposed to a plain Task sub-agent. Stamped at snapshot rebuild via
@@ -131,10 +145,22 @@ export interface UserRecord {
   sessionId: string;
   cwd: string;
   textPreview: string;
+  /** Sizes (chars, not tokens) of tool_result blocks carried by this user
+   *  message, keyed by the originating tool_use id. Token estimate is derived
+   *  downstream. Claude only. */
+  toolResults?: Array<{ toolUseId: string; chars: number }>;
+  /** Set when this message is a "Base directory for this skill:" injection —
+   *  the skill body loaded into context. `chars` measures that payload, which
+   *  the tiny Skill tool_result ("Launching skill: X") does NOT capture. */
+  skillInject?: { skill: string; chars: number };
 
   isSynthetic?: boolean;
 
   isSidechain?: boolean;
+  /** Lineage root this sub-agent transcript belongs to. Claude derives the
+   *  same thing from the file path; Codex only states it in `session_meta`,
+   *  so the parser stamps it here for `linkSidechainParents` to consume. */
+  parentSessionId?: string;
   filePath: string;
 }
 
@@ -270,4 +296,16 @@ export interface ModelSummary {
   saved: number;
   pricing: Pricing | null;
   pricingResolved: boolean;
+}
+
+export type ToolDimension = 'tool' | 'skill' | 'mcp';
+
+export interface ToolUsageSummary {
+  key: string;
+  dimension: ToolDimension;
+  chars: number;
+  estTokens: number;
+  calls: number;
+  sessions: number;
+  largestChars: number;
 }

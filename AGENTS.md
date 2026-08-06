@@ -24,9 +24,10 @@ Published to npm as `ccgauge`. End-users typically run `npx ccgauge`.
 
 ```
 app/                       Next.js routes (RSC pages + /api routes)
-  api/                     Server-side JSON endpoints (scan, usage, sessions, …)
+  api/                     Server-side JSON endpoints (scan, usage, sessions,
+                           projects, turns, blocks, pricing, export/usage)
   page.tsx                 Overview
-  usage/, sessions/, …     Drill-down pages
+  usage/, sessions/[id]/, projects/[id]/, models/, settings/   Drill-down pages
 
 bin/cli.mjs                Single-file CLI (commander). Imports the bundled
                            dist/report/index.mjs and dist/mcp/server.mjs lazily
@@ -38,11 +39,25 @@ components/                React. All client UI atoms (KpiCard, Section,
 lib/
   providers/               Per-CLI adapters (claude, codex). Add a new provider
                            by dropping a folder + one line in lib/providers/index.ts.
-  data-loader/             scan.ts (entry), indexer.ts (singleton + watchers +
-                           persist), parse-jsonl.ts (claude parser).
+                           Each adapter owns resolvePricing() + costFromUsage().
+  data-loader/             scan.ts (entry), indexer.ts (singleton + watchers),
+                           index-persist.ts (~/.ccgauge on-disk cache),
+                           parse-jsonl.ts (claude parser), link-sidechain.ts
+                           (sub-agent → parent-turn merge pass).
   aggregator/              Pure aggregations: totals, time-buckets, by-model,
                            by-project, by-session, activity heatmap.
-  pricing/                 cost-from-usage.ts (math) + per-provider rate tables.
+  blocks/                  5-hour billing-block rollups (computeBlocks). Feeds
+                           app/api/blocks + the block-progress components.
+  pricing/                 LiteLLM-sourced. litellm-pricing.generated.js is the
+                           committed snapshot (refresh: pnpm update-pricing);
+                           builtin.ts gap-fills models LiteLLM lacks; store.ts
+                           overlays a runtime LiteLLM cache + publishes to a
+                           globalThis slot; merge.ts + litellm-transform.js hold
+                           the pure merge/validate/transform; resolve.ts +
+                           calculate.ts + cost-from-usage.ts do lookup + math.
+  source.ts /              "Source" switch (claude / codex / merged), cookie-
+  source-merge.ts          driven; folds two providers' totals + buckets into
+                           one merged view.
   serialize.ts             Shape AssistantRecord[] → UsageTableRow[] /
                            UsageTurnRow[]; turn grouping lives here too.
   turns.ts                 Parent-chain walking that decides which assistant
@@ -75,10 +90,14 @@ site/                      Astro 4 marketing site (ccgauge.dev). Source-only
 pnpm dev            # Next dev on :3738, hot-reload
 pnpm typecheck      # tsc --noEmit — run before any commit
 pnpm lint           # eslint flat config — run before any commit
-pnpm test           # codex parser smoke test (node --experimental-strip-types)
+pnpm test           # 7 strip-types suites (codex-parser, pricing-snapshot,
+                    #   turns, sidechain, source-merge, cost-from-usage, range)
+                    #   + check-parser-versions + check-readme-images guards
+pnpm test:mcp       # boot the MCP server and exercise its tools
+pnpm update-pricing # regenerate lib/pricing/litellm-pricing.generated.js from LiteLLM
 pnpm build:report   # rebuild just dist/report (lib/cli-report/index.ts → bundle)
 pnpm build:mcp      # rebuild just dist/mcp
-pnpm build          # full: next build + mcp + report + postbuild
+pnpm build          # full: next build + mcp + report + postbuild + smoke-standalone
 pnpm site:dev       # Astro marketing site on :4321
 pnpm site:build     # build only site/ into site/dist
 
@@ -129,9 +148,11 @@ on 3737 by default.
     turn graph so a Skill that spawns a sub-agent shows up as ONE turn
     in the usage table, not two unrelated siblings.
     See `lib/providers/claude/index.ts#parserVersion` history:
-    `claude-v3-synthetic-flag` → `claude-v4-sidechain-merge`. Touch
-    this path? Bump `parserVersion` again — stale-cache entries are
-    invisible failures.
+    `claude-v3-synthetic-flag` → `claude-v4-sidechain-merge` →
+    `claude-v5-task-notification-synthetic` (current). Touch this path?
+    Bump `parserVersion` again — stale-cache entries are invisible
+    failures, and `scripts/check-parser-versions.mjs` (run by `pnpm test`)
+    fails when the code version drifts from `scripts/parser-versions.json`.
 
 3. **Records are deduped after parsing.**
    The same `(messageId, requestId)` can appear in multiple JSONL files
@@ -147,10 +168,30 @@ on 3737 by default.
    — bumping `parserVersion` if you touch this is mandatory or users will
    see double-counted totals against stale cache.
 
-5. **Pricing is a snapshot, not a lookup.**
-   `lib/providers/<name>/pricing.ts` ships hard-coded per-million-token rates.
-   Unknown models fall back to family-latest (e.g. `gpt-5.5-foo` → `gpt-5.5`
-   rate). Update both providers in tandem if Anthropic / OpenAI revise prices.
+5. **Pricing = committed LiteLLM snapshot, optionally overlaid by a runtime
+   refresh.** `lib/pricing/litellm-pricing.generated.js` (+ `.d.ts`) is a pinned
+   copy of LiteLLM's community price table — the same source ccusage uses —
+   regenerated by `pnpm update-pricing` (`scripts/update-pricing.mjs`). It's the
+   always-present OFFLINE base; `lib/pricing/builtin.ts` (claude) + the base in
+   `lib/providers/codex/pricing.ts` (openai) hand-fill the few models LiteLLM
+   omits (LiteLLM wins for shared keys). `lib/pricing/store.ts` layers a fresher
+   on-disk LiteLLM overlay (`~/.ccgauge/cache/litellm-pricing.json`, 24 h TTL) on
+   top of that base and publishes the merged tables into a `globalThis` slot;
+   each provider's `resolvePricing()` reads that slot (falling back to the base)
+   and layers exact → stripped → family-fallback (e.g. `gpt-5.5-foo` →
+   `gpt-5.5`). A one-shot LiteLLM refresh is kicked from the browser on load — an
+   inline `<script>` (`components/pricing-warmup.tsx`) POSTs `/api/pricing/refresh?soft=1`
+   (non-forced, TTL-gated); the "Refresh prices" button POSTs the same route
+   forced. **Do NOT trigger the fetch from a Server Component render or a layout
+   client-component `useEffect`** — either spawns work that Next's dev
+   async-tracking (`visitAsyncNode`) recurses into and stack-overflows on heavy
+   requests. The CLI + MCP entries only `ensurePricingLoaded()` (sync disk read,
+   never fetch). `CCGAUGE_OFFLINE=1` disables the fetch entirely — the base
+   snapshot then serves everything, so ccgauge can still run fully offline. Filter
+   + per-1M transform is shared between the generator and the runtime fetcher via
+   `lib/pricing/litellm-transform.js`; merge/validation lives in `lib/pricing/merge.js`.
+   Bump the committed base with `pnpm update-pricing` — never edit the generated
+   file by hand.
 
 6. **Theme + locale never flash.**
    `components/no-flash-script.tsx` is an inline `<head>` script that reads
@@ -184,10 +225,11 @@ on 3737 by default.
   Translation dictionaries live in `lib/i18n/dict.ts` (en + zh side-by-side).
   Any user-facing string belongs there; don't inline literals in components.
 - **Styling: Tailwind + a small set of `@layer components` classes** declared
-  in `app/globals.css` (`card`, `card-pad`, `label`, `num-hero`, `pill`,
-  `btn`, …). Reach for those before raw utility soup. Colors come from CSS
-  variables exposed via `tailwind.config.ts` (`text-text-primary`, `bg-brand`,
-  …) — don't hard-code hex.
+  in `app/globals.css` (`card`, `card-interactive`, `card-elevated`, `card-pad`,
+  `label`, `num-hero`, `pill`, `btn`, …). Reach for those before raw utility
+  soup; hover/elevation lives on `card-interactive` (the base `card` is static —
+  see invariant #8). Colors come from CSS variables exposed via
+  `tailwind.config.ts` (`text-text-primary`, `bg-brand`, …) — don't hard-code hex.
 - **Identity per repo.** Per the user's `~/.claude/CLAUDE.md`, this is a
   GitHub remote so use `chengzuopeng` / `mrchengzp@qq.com` for any commits.
   Never include `Co-Authored-By: Claude/Codex/...` trailers.
@@ -229,7 +271,7 @@ A short pre-flight checklist:
 | "Dashboard shows stale data after my change" | Indexer singleton + parserVersion bump (see invariant #1) |
 | "CSV opens with mojibake in Excel" | `app/api/export/usage/route.ts` (BOM, encoding) |
 | "Theme flashes on load" | `components/no-flash-script.tsx` |
-| "Pricing wrong for new model" | `lib/providers/<name>/pricing.ts` + the fallback table |
+| "Pricing wrong for new model" | `pnpm update-pricing` to refresh `lib/pricing/litellm-pricing.generated.js`; gap-fill in `lib/pricing/builtin.ts`; family fallback in each provider's `resolvePricing()` |
 | "MCP tool returns nothing" | `lib/mcp/tools/` and check `~/.ccgauge/cache/index-mcp-v2.json` exists |
 
 ## Don't break end-users
@@ -243,6 +285,9 @@ A short pre-flight checklist:
   files would break Linux / Windows installs.
 - The standalone build also drags in the `typescript` package. Same script
   strips it. The runtime never needs it.
+- After stripping, `scripts/smoke-standalone.mjs` (the final `pnpm build` step)
+  boots the packaged standalone once and pings it — a strip that goes too far
+  fails the build instead of shipping a broken tarball.
 
 If you change the build pipeline, verify `tar -tzf <pkg>.tgz | grep -E '\.(node|dylib|so|dll)$'` returns empty before publishing.
 
@@ -259,7 +304,8 @@ When cutting a new ccgauge version:
 
 1. Update `lib/providers/<name>/index.ts#parserVersion` if parsing
    behaviour changed (mandatory — stale-cache failures are silent).
-2. Run `pnpm typecheck && pnpm lint && pnpm test`.
+2. Run `pnpm typecheck && pnpm lint && pnpm test` — the `test` run's
+   `check-parser-versions` guard enforces step 1.
 3. Bump `package.json#version`.
 4. Add a `CHANGELOG.md` entry under the new version header.
 5. If features visibly changed: `pnpm screenshots` to refresh

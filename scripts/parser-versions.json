@@ -1,4 +1,4 @@
 {
-  "claude": "claude-v5-task-notification-synthetic",
-  "codex": "codex-v6-output-excludes-readded-reasoning"
+  "claude": "claude-v6-tool-result-sizes",
+  "codex": "codex-v10-turn-context-model-precedence"
 }

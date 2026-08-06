@@ -24,6 +24,10 @@ interface TurnState {
   turnId: string | null;
   cwd: string;
   model: string;
+  /** `turn_context` is the per-turn, authoritative model. Once it has spoken,
+   *  `thread_settings_applied` (thread-level, fires between turns and can carry
+   *  a stale default) must not override it. */
+  modelFromTurnContext: boolean;
   effort?: string;
   userUuid: string | null;
   toolNames: string[];
@@ -38,6 +42,37 @@ function asString(v: unknown): string {
 function asNumber(v: unknown): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * A forked subagent rollout is a MIRROR, not a new ledger: it replays the
+ * parent's history and its `total_token_usage` samples the SAME shared lineage
+ * counter the parent keeps logging, so counting it double-bills. Measured on real
+ * data: 3 concurrent subagents reported 8.54M of "own" delta while the shared
+ * counter advanced 3.13M, and a full day inflated 39.8M → 265.7M (6.7x).
+ *
+ * `forked_from_id` is the ONLY signal that separates a mirror from a real
+ * subagent thread, and it is weaker than it looks: one Codex version emits
+ * `thread_spawn` rollouts both with and without it. Verified — rollouts
+ * `…T16-03-45` (present) and `…T16-12-34` (absent) are both `thread_spawn`,
+ * both `depth: 1`, both cli_version 0.146.0-alpha.9.2, nine minutes apart. So
+ * absence does NOT mean "old Codex"; it means "this spawn kept its own ledger".
+ *
+ * There is deliberately no data-level cross-check, because none holds: a mirror
+ * that replays from the very start of the parent opens its counter at the same
+ * small value a fresh thread does (`…T16-03-45` opens at 27,131 — a mirror —
+ * versus 28,588 for the real thread in `…T16-12-34`). Distinguishing those two
+ * needs cross-file lineage state this per-file parser does not have. If Codex
+ * ever drops the field on a real mirror, double-counting returns silently;
+ * scripts/test-codex-parser.mjs pins both shapes so the rule can't be
+ * "simplified" on the false assumption that this is a version split.
+ *
+ * KNOWN GAP: user-initiated forks (`thread_source: 'user'` + `forked_from_id`)
+ * replay the source's history too, then DIVERGE into genuinely new spend, so they
+ * can't be dropped wholesale. Their replayed prefix stays double-counted.
+ */
+function isSubagentForkMirror(payload: Record<string, unknown>): boolean {
+  return asString(payload.thread_source) === 'subagent' && !!asString(payload.forked_from_id);
 }
 
 function extractMessageText(payload: Record<string, unknown>): string {
@@ -65,6 +100,11 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
   const parentLinks: Array<[string, string | null]> = [];
 
   let sessionId = '';
+  let sessionMetaSeen = false;
+  // Set only for KEPT sub-agent rollouts (guardian / auto-review / legacy
+  // spawns). Folds their turns into the conversation turn that spawned them
+  // instead of listing each review pass as its own top-level row.
+  let subagentLineageRoot = '';
   let cliVersion: string | undefined;
   let defaultCwd = '';
   let userIdx = 0;
@@ -79,6 +119,7 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
     turnId: null,
     cwd: '',
     model: 'gpt-unknown',
+    modelFromTurnContext: false,
     userUuid: null,
     toolNames: [],
     hasThinking: false,
@@ -100,7 +141,22 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
     if (rawTs) lastValidTs = rawTs;
 
     if (evt.type === 'session_meta') {
+      // Replayed history re-emits the SOURCE thread's session_meta mid-file.
+      // Rebinding identity there stamps our tail with the parent's session id.
+      if (sessionMetaSeen) continue;
+      sessionMetaSeen = true;
+
+      if (isSubagentForkMirror(payload)) {
+        rl.close();
+        stream.destroy();
+        return { assistant: [], user: [], parentLinks: [] };
+      }
+
       sessionId = asString(payload.id);
+      if (asString(payload.thread_source) === 'subagent') {
+        subagentLineageRoot =
+          asString(payload.session_id) || asString(payload.parent_thread_id) || '';
+      }
       defaultCwd = asString(payload.cwd);
       cliVersion = asString(payload.cli_version) || undefined;
 
@@ -114,7 +170,10 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
       turn.turnId = asString(payload.turn_id) || turn.turnId;
       turn.cwd = asString(payload.cwd) || defaultCwd;
       const m = asString(payload.model);
-      if (m) turn.model = m;
+      if (m) {
+        turn.model = m;
+        turn.modelFromTurnContext = true;
+      }
       const eff = asString(payload.effort);
       if (eff) turn.effort = eff;
       turn.toolNames = [];
@@ -140,6 +199,11 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
           cwd: turn.cwd || defaultCwd,
           textPreview: text.slice(0, TEXT_PREVIEW_MAX),
           filePath: file,
+          // Mirrors Claude's parse-jsonl: a sidechain user is synthetic, so it
+          // never roots a turn of its own and the walk continues to the spawner.
+          ...(subagentLineageRoot
+            ? { isSidechain: true, isSynthetic: true, parentSessionId: subagentLineageRoot }
+            : {}),
         });
         parentLinks.push([uuid, null]);
         turn.userUuid = uuid;
@@ -156,6 +220,19 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
 
       if (sub === 'agent_reasoning') {
         turn.hasThinking = true;
+        continue;
+      }
+
+      // Fallback only: rescues records that precede any `turn_context` (replayed
+      // history carries none, so they fell back to the 'gpt-unknown' placeholder).
+      // It must never outrank turn_context — this event is thread-level and in
+      // real rollouts disagrees with the active turn 116 times out of 477,
+      // which would bill e.g. a gpt-5.6-terra turn at gpt-5.6-sol's 2x rate.
+      if (sub === 'thread_settings_applied') {
+        if (turn.modelFromTurnContext) continue;
+        const settings = payload.thread_settings as Record<string, unknown> | null | undefined;
+        const m = settings ? asString(settings.model) : '';
+        if (m) turn.model = m;
         continue;
       }
 
@@ -281,6 +358,9 @@ export async function parseCodexJsonlFile(file: string): Promise<ParsedFile> {
           textPreview: turn.pendingTextPreview,
           filePath: file,
           effort: turn.effort,
+          ...(subagentLineageRoot
+            ? { isSidechain: true, parentSessionId: subagentLineageRoot }
+            : {}),
         });
         parentLinks.push([uuid, turn.userUuid]);
 

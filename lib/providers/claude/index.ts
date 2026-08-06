@@ -4,6 +4,7 @@ import { parseJsonlFile } from '@/lib/data-loader/parse-jsonl';
 import { BUILTIN_PRICING, FALLBACK_BY_FAMILY } from '@/lib/pricing/builtin';
 import { costFromUsage } from '@/lib/pricing/cost-from-usage';
 import { shortenClaudeModel } from './shorten-model';
+import type { Pricing } from '@/lib/types';
 import type { ProviderAdapter, PricingResolution } from '../types';
 
 // ===== 自定义模型定价（cc-switch 代理的第三方模型）=====
@@ -36,54 +37,74 @@ const CUSTOM_PRICING: Record<string, { input: number; output: number; cacheCreat
 const dateSuffix = /-\d{8}$/;
 const prefixRe = /^(vertex_ai|bedrock|anthropic)\//;
 
+// Runtime overlay published by lib/pricing/store.ts (loose globalThis contract so
+// this file never imports the store — see codex/pricing.ts for the rationale).
+interface PricingSlotState {
+  claude?: Record<string, Pricing>;
+  claudeFallback?: Record<string, Pricing>;
+}
+function slotState(): PricingSlotState | undefined {
+  return (
+    globalThis as unknown as { __ccgaugePricing?: { state?: PricingSlotState } }
+  ).__ccgaugePricing?.state;
+}
+function activeClaude(): Record<string, Pricing> {
+  return slotState()?.claude ?? BUILTIN_PRICING;
+}
+function activeClaudeFallback(): Record<string, Pricing> {
+  return slotState()?.claudeFallback ?? FALLBACK_BY_FAMILY;
+}
+
 function resolvePricing(model: string): PricingResolution {
   if (!model) return { pricing: null, matchType: 'none', matchedKey: null };
-  
-  // 1. 自定义模型精确匹配
+
+  // 1. 自定义模型精确匹配（cc-switch 代理的第三方模型）
   if (CUSTOM_PRICING[model]) {
     return { pricing: CUSTOM_PRICING[model], matchType: 'exact', matchedKey: model };
   }
-  
-  // 2. 官方模型精确匹配
-  if (BUILTIN_PRICING[model]) {
-    return { pricing: BUILTIN_PRICING[model], matchType: 'exact', matchedKey: model };
+
+  const pricing = activeClaude();
+
+  // 2. 模型精确匹配（运行时 overlay 优先，回退到内置快照）
+  if (pricing[model]) {
+    return { pricing: pricing[model], matchType: 'exact', matchedKey: model };
   }
-  
-  // 3. 官方模型日期后缀剥离
+
+  // 3. 日期后缀剥离
   const stripped = model.replace(dateSuffix, '');
-  if (BUILTIN_PRICING[stripped]) {
+  if (pricing[stripped]) {
     return {
-      pricing: BUILTIN_PRICING[stripped],
+      pricing: pricing[stripped],
       matchType: 'date-stripped',
       matchedKey: stripped,
     };
   }
-  
-  // 4. 官方模型 provider 前缀剥离
+
+  // 4. provider 前缀剥离
   const noPrefix = stripped.replace(prefixRe, '');
-  if (BUILTIN_PRICING[noPrefix]) {
+  if (pricing[noPrefix]) {
     return {
-      pricing: BUILTIN_PRICING[noPrefix],
+      pricing: pricing[noPrefix],
       matchType: 'prefix-stripped',
       matchedKey: noPrefix,
     };
   }
-  
+
   // 5. 自定义模型日期后缀剥离（如 deepseek-v4-pro-20250521）
-  const customStripped = model.replace(dateSuffix, '');
-  if (CUSTOM_PRICING[customStripped]) {
+  if (CUSTOM_PRICING[stripped]) {
     return {
-      pricing: CUSTOM_PRICING[customStripped],
+      pricing: CUSTOM_PRICING[stripped],
       matchType: 'date-stripped',
-      matchedKey: customStripped,
+      matchedKey: stripped,
     };
   }
-  
+
   // 6. 官方模型 family fallback
+  const fallback = activeClaudeFallback();
   for (const family of ['fable', 'opus', 'sonnet', 'haiku']) {
     if (model.toLowerCase().includes(family)) {
       return {
-        pricing: FALLBACK_BY_FAMILY[family],
+        pricing: fallback[family] ?? null,
         matchType: 'family-fallback',
         matchedKey: `claude-${family}-(latest)`,
       };
@@ -114,7 +135,7 @@ export const claudeAdapter: ProviderAdapter = {
   color: { fg: '#b45309', bg: '#fef3c7' },
   logoSrc: '/claude-logo.webp',
 
-  parserVersion: 'claude-v5-task-notification-synthetic',
+  parserVersion: 'claude-v6-tool-result-sizes',
   capabilities: {
     hasCacheCreation: true,
     hasReasoningTokens: false,

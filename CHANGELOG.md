@@ -5,6 +5,250 @@ All notable changes to **ccgauge** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-08-01
+
+Follow-up to 1.4.0. Codex sub-agents come in more shapes than that release
+accounted for, and its `thread_settings_applied` fallback turned out to
+mis-price a turn. Upgrade if you use Codex; the persisted index reparses
+itself on first load.
+
+### Fixed
+
+- **A turn's model is no longer overwritten by a stale thread default.** The
+  `thread_settings_applied` fallback added in 1.4.0 overwrote the model
+  unconditionally, but that event is *thread*-level and fires between turns
+  while `turn_context` is per-turn and authoritative. In a real history 116 of
+  477 such events disagree with the turn they land in, and records caught in
+  between were stamped with the wrong model — `gpt-5.6-terra` billed as
+  `gpt-5.6-sol` is exactly **2×** (input 5.0/output 30.0 vs 2.5/15.0). It is
+  now a fallback in truth: it only fills in for records that precede any
+  `turn_context`.
+- **Sub-agent threads with no user record no longer explode into one row per
+  API call.** Some Codex sub-agent rollouts deliver the task prompt as a
+  `response_item` rather than a `user_message`, so the transcript contains zero
+  user records. 1.4.0 only ever anchored *user* records, so those threads had
+  nothing to anchor and every single call surfaced as its own "(no user text)"
+  row — 71 of them across two threads in one afternoon. Unparented sub-agent
+  *assistant* records are anchored too now.
+- **A sub-agent row keeps its text when its spawning turn is out of scope.**
+  Sub-agent seed prompts are marked synthetic so they fold into the turn that
+  spawned them, but the turn index runs over the range-filtered records while
+  the parent map is unfiltered — so a date range that cuts between a turn and
+  its sub-agent, or a parent transcript that has been archived, left the row
+  with no text at all. The seed is now the last-resort root: it never outranks
+  a real turn, so folding is unchanged whenever the spawner is in scope.
+
+### Changed
+
+- Codex `parserVersion` → `codex-v10-turn-context-model-precedence`.
+
+### Internal
+
+- The `isSubagentForkMirror` rationale was wrong and is corrected: `thread_spawn`
+  rollouts appear both with and without `forked_from_id` **within one Codex
+  version**, so absence never meant "old Codex". Also documents why no
+  data-level cross-check replaces the flag — a mirror replaying the parent from
+  the start opens its token counter *lower* than a fresh thread does (27,131 vs
+  28,588 observed), so the obvious heuristic classifies them backwards. Both
+  shapes are now pinned by tests.
+- The sub-agent path regex is memoised per transcript. Linking became a
+  per-record loop in 1.4.0, which made a large Claude history pay tens of
+  thousands of extra regex executions per index rebuild.
+- Skipped rollouts each get their own empty parse result instead of sharing one
+  frozen singleton whose inner arrays were never actually frozen.
+
+## [1.4.0] — 2026-08-01
+
+Codex sub-agent support. Codex 0.146 runs sub-agents as forked threads, one
+rollout file each — a shape the Codex parser had no notion of, so a single
+conversation turn could be billed seven times over and its sub-agents scattered
+across the usage table as look-alike rows. Two fixes: stop counting the mirrors,
+and fold the sub-agents that *are* real spend into the turn that spawned them.
+
+### Fixed
+
+- **Sub-agent fork rollouts no longer double-count.** A `thread_spawn`
+  sub-agent's rollout is a mirror, not a new ledger: it replays the parent's
+  history verbatim and its `total_token_usage` samples the *same* shared lineage
+  counter the parent keeps logging. Parsing each as an independent session
+  re-billed the parent's whole history once per sub-agent — measured on a real
+  day, **39.8M actual vs 265.7M reported (6.7×)**, with two identical
+  19.97M / \$35.13 and 1.73M / \$2.99 rows repeated eight times. Trimming the
+  replayed prefix isn't enough either: three concurrent sub-agents claimed 8.54M
+  of post-fork "own" delta while the shared counter advanced 3.13M. These files
+  are now skipped whole. Guardian / auto-review sub-agents and older
+  `thread_spawn` rollouts own an independent counter and are unaffected.
+- **`gpt-unknown` no longer shows up in the model column.** Replayed history
+  carries no `turn_context`, so most records in a forked rollout fell back to
+  the placeholder — 65 of 87 in a typical file. The real model is in
+  `thread_settings_applied`, which is now read as a fallback.
+- **A replayed `session_meta` no longer rebinds the file's identity.** Replayed
+  history re-emits the source thread's `session_meta` mid-file, which stamped
+  everything after it with the parent's session id and cwd. Only the first
+  `session_meta` binds now.
+
+### Changed
+
+- **Codex sub-agent turns fold into the conversation turn that spawned them**,
+  the way Claude sub-agents already did — they become expandable children of
+  that row instead of separate top-level rows. Two things had to change: the
+  parent session comes from `session_meta` (Codex rollouts sit in a flat
+  date-tree, so there's no parent id in the path to key off), and *every*
+  unparented sub-agent turn is anchored rather than only the first per file —
+  one Codex guardian thread holds several independent turns, since it re-reviews
+  after each approval. Totals are untouched; only the grouping changes.
+
+### Internal
+
+- Codex `parserVersion` → `codex-v8-subagent-sidechain-linking`. The persisted
+  index reparses Codex transcripts automatically on first load; existing
+  histories will show corrected numbers without any manual step.
+- Known gap, documented at the call site: user-initiated forks
+  (`thread_source: 'user'` + `forked_from_id`) replay the source's history too,
+  then diverge into genuinely new spend, so they can't be dropped wholesale.
+  Their replayed prefix stays double-counted — cutting it needs cross-file
+  lineage state the per-file parser doesn't have.
+
+## [1.3.1] — 2026-07-24
+
+Performance release: large histories index dramatically faster, and `next dev`
+no longer crashes on them. All three fixes are in `lib/data-loader/indexer.ts`
+and change no behavior — same files parsed, same records, same order.
+Contributed by [@kayorid](https://github.com/kayorid) in
+[#2](https://github.com/chengzuopeng/ccgauge/pull/2) — thanks!
+
+### Fixed
+
+- **Bounded scan concurrency.** The cold index ran `Promise.all` over the
+  entire transcript list; at ~20k files that means as many concurrent read
+  streams plus every parsed record alive at once (GC thrash, minutes-long
+  scans), and the thousands-deep async chain overflowed the stack inside
+  Next.js dev's async-debug walker — surfacing as a baffling, far-from-cause
+  `Maximum call stack size exceeded`. Parsing now runs through a fixed worker
+  pool (`max(8, min(32, cpus × 4))` lanes). Measured by the contributor at
+  ~19k transcripts: dev cold start from >600 s (or a crash) to ~51 s.
+- **No more spread-append in snapshot assembly.** `push(...records)` passes
+  every record as a separate argument, so one long transcript could exceed the
+  engine's argument limit — a second, independent source of the same stack
+  overflow. Replaced with plain loops.
+- **Byte-order timestamp sort.** Snapshot sorting used `localeCompare` on
+  ISO-8601 timestamps; ICU collation is orders of magnitude slower than the
+  byte comparison that already yields chronological order. Now matches the
+  comparator `link-sidechain.ts` always used.
+
+## [1.3.0] — 2026-07-20
+
+Two headline features. **Tools & skills**: a new page that answers "which
+tool or skill is eating my tokens?"
+([#1](https://github.com/chengzuopeng/ccgauge/issues/1)). **Live pricing**:
+ccgauge can now refresh its model-price table from LiteLLM at runtime instead
+of only shipping a build-time snapshot.
+
+### Added
+
+- **Tools & skills page** (`/tools`, under the new Analytics nav dropdown) —
+  ranks every tool, skill, and MCP server by **estimated context footprint**:
+  the size of each tool_result / skill-body payload is attributed to the
+  tool that produced it and converted to tokens at ~4 chars/token. Three
+  breakdown dimensions (by skill / by tool / by MCP server), top-consumer
+  emphasis, and expandable per-row stats (invocations, sessions, avg per
+  call, largest single payload). The numbers are estimates — Anthropic
+  doesn't bill per tool, and the page says so — but the *ranking* is what
+  finds the skill that's quietly costing 80% of your context. Claude source
+  only for now; Codex rollout files don't carry the needed shape.
+- **Skill-body measurement.** A skill invocation's real payload is the
+  synthetic "Base directory for this skill:" message, not the tiny
+  "Launching skill: X" tool_result ack. The parser now measures that body
+  and credits it to the skill by name (claude parserVersion bumped to v6;
+  the persisted index reparses automatically on first load).
+- **Runtime pricing refresh.** On the first page load the web server fetches
+  LiteLLM's price table in the background, validates it, and caches it to
+  `~/.ccgauge/cache/litellm-pricing.json` (24 h TTL, atomic write). The cached
+  overlay layers on top of the committed snapshot, so a newly-released model
+  (e.g. `gpt-5.6`, `claude-sonnet-5`) is priced correctly without waiting for a
+  ccgauge release. The fetch is single-flighted, 5 s-timeout-bounded, and never
+  blocks a request; a bad/short upstream table is rejected and the built-in
+  snapshot stays in place.
+- **"Refresh prices" button** on the Settings pricing panel, plus a source line
+  showing whether prices are the built-in snapshot or a cached LiteLLM copy and
+  when it was fetched.
+- **`CCGAUGE_OFFLINE=1`** (or `CCGAUGE_PRICING_OFFLINE=1`) disables all pricing
+  network access; the CLI and MCP server never fetch regardless — they only read
+  the on-disk overlay.
+
+### Changed
+
+- **Nav: analytics pages folded into a dropdown.** Sessions / Projects /
+  Models / Tools now live under one "Analytics" item with a hover dropdown
+  (opens on focus too, so touch works). The sliding underline parks on
+  Analytics whenever a sub-route is active, and the active sub-page is
+  highlighted inside the menu.
+- Provider cost resolution now reads a runtime pricing overlay (built-in
+  snapshot → on-disk LiteLLM cache) shared by the dashboard, CLI, and MCP server,
+  so a refresh flows into cost math everywhere, not just the settings table.
+- Privacy copy updated: the README and Settings "About" note now state that the
+  only optional outbound request is the LiteLLM price fetch (off with
+  `CCGAUGE_OFFLINE=1`); your usage data still never leaves the machine.
+- Refreshed the committed LiteLLM snapshot (adds `gpt-5.6*`, `claude-sonnet-5`).
+
+### Fixed
+
+- **Dedup no longer drops tool_use ids from streamed turns.** A streamed
+  assistant turn is split across several JSONL records sharing
+  `messageId::requestId` (thinking / text / tool_use chunks); dedup kept only
+  the earliest record — often the thinking-only chunk — silently discarding
+  96% of tool_use ids. Harmless before, but it would have left the new
+  by-tool attribution ~75% "(unknown)". Dedup now unions tool_use refs
+  across the chunk group (usage/cost math unchanged).
+
+## [1.2.3] — 2026-07-08
+
+Two fixes to the `/usage` overview area.
+
+### Fixed
+
+- **The "Overview" toggle now actually hides the overview.** The eye button in
+  the Usage header is meant to collapse the KPI cards *and* the trend chart in
+  one click (its own tooltip reads "KPIs + trend"), leaving just the Requests
+  table. But neither element carried the `.usage-overview-block` class the CSS
+  targets, so the button flipped its state and nothing moved. The KPI grid, the
+  Trend section, and both of their loading skeletons now carry the class, so the
+  toggle collapses and restores the whole overview as intended.
+- **Restored the gap between the trend chart and the Requests table.** The
+  Requests section was missing its top margin and sat flush against the trend
+  card; it now uses `mt-4` to match the vertical rhythm of the rest of the page.
+
+## [1.2.2] — 2026-06-19
+
+Fixes a real footgun in the v1.2.0 Codex fast-tier multiplier: the result of
+reading `~/.codex/config.toml` was memoized at module load, so toggling
+`service_tier` required a full server restart to take effect. The detection
+logic itself is intentionally kept identical to ccusage's
+`adapter/codex/speed.rs` — that's the only practical proxy available, since
+the rollout JSONL doesn't record the active service tier per turn.
+
+### Fixed
+
+- **No more boot-time cache on the fast-tier detection.**
+  `detectCodexFastTier()` now re-reads `config.toml` on every call (a
+  ~few-hundred-byte read per request, negligible). Live verification: with
+  `service_tier="fast"` Codex totals come in at \$256.76; flip to
+  `"default"` mid-session and the next `/api/turns` request reports \$102.70
+  with `codexFastActive=false`; flip back to `"fast"` and it returns to
+  \$256.76 — all without touching the process.
+
+### Known limitation
+
+- **Per-turn fast-mode is unrecoverable from rollout data.** If you toggle
+  `service_tier` over time, historical turns recorded under the previous
+  setting are still billed at the *current* setting's rate. ccusage
+  v20.0.14 has the same behavior. The dashboard reflects "what would my
+  bill be if every Codex turn ran under the active tier", not absolute
+  historical truth — there is no field in the rollout JSONL that records
+  the tier at API-call time (verified by exhaustive inspection of every
+  payload across `token_count` / `session_meta` / `turn_context` events
+  plus `~/.codex/.codex-global-state.json`).
+
 ## [1.2.1] — 2026-06-18
 
 Fixes two stacking / clipping bugs on the usage page that made dropdowns

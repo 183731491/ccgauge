@@ -259,4 +259,309 @@ const PROJ = `/Users/x/.claude/projects/-proj/${SESSION}`;
   console.log('✓ N>1 fan-out: 3 sub-agents fold into 1 turn; badge count = 2 distinct workflow files');
 }
 
+// ── Codex sub-agents: parent stated on the record, N turns per file ────
+// Codex rollouts live in a flat `~/.codex/sessions/YYYY/MM/DD/` tree, so the
+// path carries no parent — the parser stamps `parentSessionId` from
+// session_meta instead. And unlike Claude, ONE Codex sub-agent thread holds
+// several independent `user_message` turns (a guardian re-reviews after each
+// approval), each with a null parent, so every one of them must be anchored —
+// anchoring only the first left the other 5 as top-level rows.
+{
+  const rootSession = '019fbb48-bc45-7640-999c-874bb086ae31';
+  const codexDir = '/Users/x/.codex/sessions/2026/08/01';
+  const mainFile = `${codexDir}/rollout-2026-08-01T11-05-34-${rootSession}.jsonl`;
+  const guardFile = `${codexDir}/rollout-2026-08-01T14-08-07-019fbbef-dd7f.jsonl`;
+
+  const uMain = {
+    uuid: 'cx-u-main',
+    textPreview: '已确认，就以 TD 为准。现在请按照 td 文档，帮我完整的实现埋点功能',
+    isSynthetic: false,
+    sessionId: rootSession,
+    timestamp: '2026-08-01T06:06:57.000Z',
+    filePath: mainFile,
+  };
+  const aMain = {
+    uuid: 'cx-a-main',
+    sessionId: rootSession,
+    timestamp: '2026-08-01T06:07:00.000Z',
+    filePath: mainFile,
+  };
+
+  // Six guardian review passes across two files — five in one thread.
+  const pass = (n, ts, file) => [
+    {
+      uuid: `cx-gu-${n}`,
+      textPreview: 'The following is the Codex agent history …',
+      isSynthetic: true,
+      isSidechain: true,
+      parentSessionId: rootSession,
+      sessionId: 'guardian-thread',
+      timestamp: ts,
+      filePath: file,
+    },
+    {
+      uuid: `cx-ga-${n}`,
+      isSidechain: true,
+      sessionId: 'guardian-thread',
+      timestamp: ts,
+      filePath: file,
+    },
+  ];
+  const passes = [
+    pass(1, '2026-08-01T06:08:15.000Z', guardFile),
+    pass(2, '2026-08-01T06:27:34.000Z', guardFile),
+    pass(3, '2026-08-01T06:29:52.000Z', guardFile),
+    pass(4, '2026-08-01T06:30:10.000Z', guardFile),
+    pass(5, '2026-08-01T06:30:50.000Z', guardFile),
+    pass(6, '2026-08-01T06:33:01.000Z', `${codexDir}/rollout-2026-08-01T14-20-35-019fbbfb-45bb.jsonl`),
+  ];
+
+  const users = [uMain, ...passes.map(([u]) => u)];
+  const assistants = [aMain, ...passes.map(([, a]) => a)];
+  const parentMap = { 'cx-u-main': null, 'cx-a-main': 'cx-u-main' };
+  for (const [u, a] of passes) {
+    parentMap[u.uuid] = null;
+    parentMap[a.uuid] = u.uuid;
+  }
+
+  const stats = linkSidechainParents({
+    assistantRecords: assistants,
+    userRecords: users,
+    parentMap,
+  });
+  assert.equal(stats.relinked, 6, 'every guardian turn is anchored, not just the first per file');
+  assert.equal(stats.orphans, 0, 'parent resolved from parentSessionId, not from the path');
+  assert.equal(stats.subagentFiles, 2, 'file count stays per-file even with 5 turns in one file');
+
+  const index = buildTurnIndex(assistants, users, parentMap);
+  assert.equal(index.get('cx-a-main'), 'cx-u-main');
+  for (const [, a] of passes) {
+    assert.equal(index.get(a.uuid), 'cx-u-main', `${a.uuid} folds into the spawning conversation turn`);
+  }
+
+  // A sub-agent whose parent rollout is missing stays an orphan rather than
+  // being mis-anchored onto an unrelated conversation.
+  const orphanMap = { 'cx-orphan-u': null, 'cx-orphan-a': 'cx-orphan-u' };
+  const orphanStats = linkSidechainParents({
+    assistantRecords: [{ uuid: 'cx-orphan-a', isSidechain: true, sessionId: 'g2', timestamp: '2026-08-01T06:08:15.000Z', filePath: guardFile }],
+    userRecords: [{
+      uuid: 'cx-orphan-u',
+      textPreview: 'seed',
+      isSynthetic: true,
+      isSidechain: true,
+      parentSessionId: 'session-not-on-disk',
+      sessionId: 'g2',
+      timestamp: '2026-08-01T06:08:15.000Z',
+      filePath: guardFile,
+    }],
+    parentMap: orphanMap,
+  });
+  assert.equal(orphanStats.orphans, 1, 'unknown parent session → orphan, never a wrong anchor');
+  assert.equal(orphanMap['cx-orphan-u'], null, 'orphan parent link left untouched');
+
+  console.log('✓ codex sub-agents: parentSessionId anchoring, all N turns per file, orphan safety');
+}
+
+// ── Codex sub-agent threads that carry NO user record ─────────────────
+// Some Codex sub-agent rollouts deliver the task prompt as a `response_item`
+// with role "user" instead of a `user_message` event, so the file yields zero
+// UserRecords. With nothing for the user pass to anchor, every single API call
+// in the thread surfaced as its own "(no user text)" row — 71 of them across
+// two threads on 2026-08-01. Unparented sidechain ASSISTANTS are anchored too.
+{
+  const rootSession = '019fbb48-bc45-7640-999c-874bb086ae31';
+  const codexDir = '/Users/x/.codex/sessions/2026/08/01';
+  const mainFile = `${codexDir}/rollout-2026-08-01T11-05-34-${rootSession}.jsonl`;
+  const subFile = `${codexDir}/rollout-2026-08-01T16-12-34-019fbc61-d063.jsonl`;
+
+  const uMain = {
+    uuid: 'nu-u-main',
+    textPreview: '好，就按你建议，完成全部问题的修复',
+    isSynthetic: false,
+    sessionId: rootSession,
+    timestamp: '2026-08-01T08:03:31.000Z',
+    filePath: mainFile,
+  };
+  const aMain = {
+    uuid: 'nu-a-main',
+    sessionId: rootSession,
+    timestamp: '2026-08-01T08:03:35.000Z',
+    filePath: mainFile,
+  };
+  // Sub-agent thread: assistants only, every one with a null parent.
+  const subAsst = ['08:12:40', '08:13:12', '08:14:31'].map((hhmmss, i) => ({
+    uuid: `nu-sa-${i}`,
+    isSidechain: true,
+    parentSessionId: rootSession,
+    sessionId: '019fbc61-d063',
+    timestamp: `2026-08-01T${hhmmss}.000Z`,
+    filePath: subFile,
+  }));
+
+  const parentMap = { 'nu-u-main': null, 'nu-a-main': 'nu-u-main' };
+  for (const a of subAsst) parentMap[a.uuid] = null;
+
+  const assistants = [aMain, ...subAsst];
+  const users = [uMain];
+  const stats = linkSidechainParents({ assistantRecords: assistants, userRecords: users, parentMap });
+
+  assert.equal(stats.relinked, 3, 'all three userless sub-agent calls anchored');
+  assert.equal(stats.subagentFiles, 1, 'counted as one sub-agent file');
+
+  const index = buildTurnIndex(assistants, users, parentMap);
+  for (const a of subAsst) {
+    assert.equal(index.get(a.uuid), 'nu-u-main', `${a.uuid} folds into the spawning turn`);
+  }
+  console.log('✓ userless codex sub-agent thread: assistants anchored, no per-call orphan rows');
+}
+
+// ── orphan fallback: an unanchored sub-agent seed still roots a turn ───
+// A sub-agent seed prompt is marked synthetic so it folds into its spawner.
+// When linking can't find that spawner (parent transcript archived, or it
+// produced no records) the seed must root its own turn — otherwise marking it
+// synthetic is strictly worse than not linking at all: the row loses its text.
+{
+  const orphanFile = '/Users/x/.codex/sessions/2026/07/17/rollout-review-sub.jsonl';
+  const seed = {
+    uuid: 'of-user',
+    textPreview: 'Review the diff on branch …',
+    isSynthetic: true,
+    isSidechain: true,
+    parentSessionId: 'root-not-on-disk',
+    sessionId: 'review-thread',
+    timestamp: '2026-07-17T07:53:12.000Z',
+    filePath: orphanFile,
+  };
+  const asst = {
+    uuid: 'of-asst',
+    isSidechain: true,
+    parentSessionId: 'root-not-on-disk',
+    sessionId: 'review-thread',
+    timestamp: '2026-07-17T07:53:20.000Z',
+    filePath: orphanFile,
+  };
+  const parentMap = { 'of-user': null, 'of-asst': 'of-user' };
+
+  const stats = linkSidechainParents({
+    assistantRecords: [asst],
+    userRecords: [seed],
+    parentMap,
+  });
+  assert.equal(stats.relinked, 0, 'nothing to anchor onto');
+  assert.equal(stats.orphans, 1, 'seed reported as orphan');
+
+  const index = buildTurnIndex([asst], [seed], parentMap);
+  assert.equal(
+    index.get('of-asst'),
+    'of-user',
+    'unanchored seed roots its own turn, so the row keeps its text',
+  );
+
+  // Same records, but now the spawner IS present: the seed goes back to being
+  // synthetic and the turn folds — the synthetic bypass must not be sticky.
+  const rootAsst = {
+    uuid: 'of-root-asst',
+    sessionId: 'root-not-on-disk',
+    timestamp: '2026-07-17T07:53:00.000Z',
+    filePath: '/Users/x/.codex/sessions/2026/07/17/rollout-root.jsonl',
+  };
+  const rootUser = {
+    uuid: 'of-root-user',
+    textPreview: 'kick off the review',
+    isSynthetic: false,
+    sessionId: 'root-not-on-disk',
+    timestamp: '2026-07-17T07:52:50.000Z',
+    filePath: '/Users/x/.codex/sessions/2026/07/17/rollout-root.jsonl',
+  };
+  const map2 = { 'of-root-user': null, 'of-root-asst': 'of-root-user', 'of-user': null, 'of-asst': 'of-user' };
+  linkSidechainParents({
+    assistantRecords: [rootAsst, asst],
+    userRecords: [rootUser, seed],
+    parentMap: map2,
+  });
+  const index2 = buildTurnIndex([rootAsst, asst], [rootUser, seed], map2);
+  assert.equal(
+    index2.get('of-asst'),
+    'of-root-user',
+    'once the spawner exists the same seed folds again (bypass is derived, not sticky)',
+  );
+  console.log('✓ orphan fallback: unanchored seed keeps its text; folds again once the spawner appears');
+}
+
+// ── filter boundary: linking is global, buildTurnIndex is filtered ────
+// lib/serialize.ts and app/page.tsx call buildTurnIndex with the range/source
+// FILTERED records but the UNFILTERED parentMap. A date range that cuts between
+// a spawning turn and its sub-agent leaves the walk with no real user in scope,
+// which used to strip the row's text entirely. The seed is the last-resort root.
+{
+  const rootSession = 'root-boundary';
+  const dir = '/Users/x/.codex/sessions/2026/08/01';
+  const uMain = {
+    uuid: 'fb-u-main',
+    textPreview: '已确认，就以 TD 为准',
+    isSynthetic: false,
+    sessionId: rootSession,
+    timestamp: '2026-08-01T06:06:57.000Z',
+    filePath: `${dir}/rollout-root.jsonl`,
+  };
+  const aMain = {
+    uuid: 'fb-a-main',
+    sessionId: rootSession,
+    timestamp: '2026-08-01T06:07:05.000Z',
+    filePath: `${dir}/rollout-root.jsonl`,
+  };
+  const guardUser = {
+    uuid: 'fb-g-user',
+    textPreview: 'The following is the Codex agent history …',
+    isSynthetic: true,
+    isSidechain: true,
+    parentSessionId: rootSession,
+    sessionId: 'guardian',
+    timestamp: '2026-08-01T06:08:15.000Z',
+    filePath: `${dir}/rollout-guardian.jsonl`,
+  };
+  const guardAsst = {
+    uuid: 'fb-g-asst',
+    isSidechain: true,
+    parentSessionId: rootSession,
+    sessionId: 'guardian',
+    timestamp: '2026-08-01T06:08:20.000Z',
+    filePath: `${dir}/rollout-guardian.jsonl`,
+  };
+
+  const all = { assistants: [aMain, guardAsst], users: [uMain, guardUser] };
+  const parentMap = { 'fb-u-main': null, 'fb-a-main': 'fb-u-main', 'fb-g-user': null, 'fb-g-asst': 'fb-g-user' };
+  linkSidechainParents({ assistantRecords: all.assistants, userRecords: all.users, parentMap });
+  assert.equal(parentMap['fb-g-user'], 'fb-a-main', 'guardian linked while unfiltered');
+
+  // Unfiltered: folds into the real conversation turn.
+  const whole = buildTurnIndex(all.assistants, all.users, parentMap);
+  assert.equal(whole.get('fb-g-asst'), 'fb-u-main', 'in range, guardian folds into the spawning turn');
+
+  // Filtered so the spawning USER falls outside the window (its assistant does
+  // not) — the previous behaviour merged the guardian into a text-less row.
+  const cutUser = buildTurnIndex(all.assistants, [guardUser], parentMap);
+  assert.equal(
+    cutUser.get('fb-g-asst'),
+    'fb-g-user',
+    'spawning user out of range -> guardian roots at its own seed, keeping text',
+  );
+
+  // Filtered so the whole spawning thread is outside the window.
+  const cutAll = buildTurnIndex([guardAsst], [guardUser], parentMap);
+  assert.equal(
+    cutAll.get('fb-g-asst'),
+    'fb-g-user',
+    'spawning thread fully out of range -> still roots at the seed, not a per-call orphan',
+  );
+
+  // The fallback must not drag the spawning thread's own records into the
+  // sub-agent's turn via the memo — aMain still roots at its own user.
+  const both = buildTurnIndex([guardAsst, aMain], all.users, parentMap);
+  assert.equal(both.get('fb-a-main'), 'fb-u-main', 'parent record keeps its own root after a fallback walk');
+  assert.equal(both.get('fb-g-asst'), 'fb-u-main', 'and the guardian still folds when both are in range');
+
+  console.log('✓ filter boundary: seed is the last-resort root; memo never steals the parent thread');
+}
+
 console.log('\nAll sidechain-linking assertions passed.');

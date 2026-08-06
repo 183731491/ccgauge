@@ -14,10 +14,9 @@ const { costFromUsage } = await import(join(root, 'lib/pricing/cost-from-usage.t
 const { shortenCodexModel } = await import(join(root, 'lib/providers/codex/shorten-model.ts'));
 const {
   scaleCodexPricing,
+  codexFastMultiplier,
   codexConfigRequestsFastTier,
   detectCodexFastTier,
-  codexFastMultiplier,
-  __resetCodexFastTierCacheForTest,
 } = await import(join(root, 'lib/providers/codex/speed.ts'));
 const { parseDateLike, parseLocalDateOnly } = await import(join(root, 'lib/date-utils.ts'));
 const { isUsageRange, normalizeUsageRange, rangeToDates } = await import(join(root, 'lib/range.ts'));
@@ -266,6 +265,354 @@ assert.ok(rangeToDates('7d').from instanceof Date);
   console.log('✓ total → last → total counts each tranche once');
 }
 
+{
+  // Codex >=0.146 runs subagents as FORKED threads. Each gets its own rollout
+  // that (a) replays the parent's history verbatim and (b) keeps sampling the
+  // parent's SHARED lineage token counter. Parsing them as independent sessions
+  // billed the parent's whole history once per subagent.
+  //
+  // Measured on real ~/.codex data (2026-08-01, one user turn, 8 subagents):
+  //   - every subagent file re-emitted the same two parent turns (19.97M / 1.73M)
+  //   - 3 concurrent subagents claimed 8.54M of post-fork "own" delta while the
+  //     shared counter only advanced 3.13M -> even post-fork deltas double-count
+  //   - day total: 39.8M actual vs 265.7M parsed (6.7x)
+  // So the whole file must go, not just its replayed prefix.
+  const dir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-fork-'));
+  const tokenCount = (ts, input, output) =>
+    JSON.stringify({
+      timestamp: ts,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: output,
+            reasoning_output_tokens: 0,
+          },
+        },
+      },
+    });
+
+  const forkMeta = {
+    id: 'sub-thread-1',
+    session_id: 'root-thread',
+    forked_from_id: 'root-thread',
+    parent_thread_id: 'root-thread',
+    cwd: '/tmp/proj',
+    thread_source: 'subagent',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-thread', depth: 1 } } },
+  };
+  const forkFile = join(dir, 'fork.jsonl');
+  writeFileSync(
+    forkFile,
+    [
+      JSON.stringify({ timestamp: '2026-08-01T06:07:20Z', type: 'session_meta', payload: forkMeta }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:07:20Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'replayed parent turn' },
+      }),
+      tokenCount('2026-08-01T06:07:20Z', 13_861_434, 62_397),
+      tokenCount('2026-08-01T06:07:36Z', 21_759_038, 98_805),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  const fork = await parseCodexJsonlFile(forkFile);
+  assert.equal(fork.assistant.length, 0, 'thread_spawn fork mirror emits no records');
+  assert.equal(fork.user.length, 0, 'thread_spawn fork mirror emits no user records');
+  assert.equal(fork.parentLinks.length, 0, 'thread_spawn fork mirror emits no parent links');
+
+  // Guardian / auto-review subagents set NO forked_from_id and own an
+  // independent counter starting near 0 -> genuine spend, must be kept.
+  const guardianFile = join(dir, 'guardian.jsonl');
+  writeFileSync(
+    guardianFile,
+    [
+      JSON.stringify({
+        timestamp: '2026-08-01T06:08:07Z',
+        type: 'session_meta',
+        payload: {
+          id: 'guardian-1',
+          session_id: 'root-thread',
+          parent_thread_id: 'root-thread',
+          cwd: '/tmp/proj',
+          thread_source: 'subagent',
+          source: { subagent: { other: 'guardian' } },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:08:07Z',
+        type: 'turn_context',
+        payload: { turn_id: 'g-1', cwd: '/tmp/proj', model: 'codex-auto-review' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:08:07Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'The following is the Codex agent history' },
+      }),
+      tokenCount('2026-08-01T06:08:10Z', 19_122, 258),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  const guardian = await parseCodexJsonlFile(guardianFile);
+  assert.equal(guardian.assistant.length, 1, 'guardian subagent is real spend, not a mirror');
+  assert.equal(guardian.assistant[0].model, 'codex-auto-review');
+
+  // Older thread_spawn rollouts predate forked_from_id and had their own
+  // counter — absence of the field must never be read as "mirror".
+  const legacyFile = join(dir, 'legacy-spawn.jsonl');
+  writeFileSync(
+    legacyFile,
+    [
+      JSON.stringify({
+        timestamp: '2026-07-22T10:04:49Z',
+        type: 'session_meta',
+        payload: {
+          id: 'legacy-sub',
+          parent_thread_id: 'root-old',
+          cwd: '/tmp/proj',
+          thread_source: 'subagent',
+          source: { subagent: { thread_spawn: { parent_thread_id: 'root-old', depth: 1 } } },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-22T10:04:50Z',
+        type: 'turn_context',
+        payload: { turn_id: 'l-1', cwd: '/tmp/proj', model: 'gpt-5' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-22T10:04:51Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'go' },
+      }),
+      tokenCount('2026-07-22T10:05:01Z', 24_797, 224),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  const legacy = await parseCodexJsonlFile(legacyFile);
+  assert.equal(legacy.assistant.length, 1, 'legacy thread_spawn without forked_from_id is kept');
+
+  // `forked_from_id` is NOT a version split — one Codex build emits
+  // `thread_spawn` both ways (…T16-03-45 has it, …T16-12-34 doesn't; both
+  // depth 1, both cli_version 0.146.0-alpha.9.2, nine minutes apart). Pinned
+  // so nobody "simplifies" the rule to `thread_spawn -> mirror`, which would
+  // silently delete real spend. Nor can it be replaced by a counter-baseline
+  // check: the mirror below opens at 27,131, LOWER than the real thread's
+  // 28,588, because it replays the parent from the very beginning.
+  const sameVersion = (id, forked, firstTotal) =>
+    [
+      JSON.stringify({
+        timestamp: '2026-08-01T08:03:45Z',
+        type: 'session_meta',
+        payload: {
+          id,
+          session_id: 'root-thread',
+          ...(forked ? { forked_from_id: 'root-thread' } : {}),
+          parent_thread_id: 'root-thread',
+          cwd: '/tmp/proj',
+          cli_version: '0.146.0-alpha.9.2',
+          thread_source: 'subagent',
+          source: { subagent: { thread_spawn: { parent_thread_id: 'root-thread', depth: 1 } } },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T08:03:46Z',
+        type: 'turn_context',
+        payload: { turn_id: `t-${id}`, cwd: '/tmp/proj', model: 'gpt-5.6-sol' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T08:03:47Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'go' },
+      }),
+      tokenCount('2026-08-01T08:03:48Z', firstTotal, 100),
+    ].join('\n') + '\n';
+
+  const mirrorFile = join(dir, 'same-version-mirror.jsonl');
+  writeFileSync(mirrorFile, sameVersion('spawn-mirror', true, 27_131), 'utf8');
+  assert.equal(
+    (await parseCodexJsonlFile(mirrorFile)).assistant.length,
+    0,
+    'thread_spawn WITH forked_from_id is a mirror even though its counter starts low',
+  );
+
+  const realFile = join(dir, 'same-version-real.jsonl');
+  writeFileSync(realFile, sameVersion('spawn-real', false, 28_588), 'utf8');
+  assert.equal(
+    (await parseCodexJsonlFile(realFile)).assistant.length,
+    1,
+    'same cli_version, no forked_from_id -> real thread, kept',
+  );
+
+  // The empty result must not be a shared singleton: two skipped files handing
+  // back the same array instances means one mutation corrupts every entry.
+  const a = await parseCodexJsonlFile(forkFile);
+  const b = await parseCodexJsonlFile(mirrorFile);
+  assert.notEqual(a.assistant, b.assistant, 'skipped files get their own arrays');
+  assert.notEqual(a.user, b.user, 'skipped files get their own arrays');
+  assert.notEqual(a.parentLinks, b.parentLinks, 'skipped files get their own arrays');
+
+  rmSync(dir, { recursive: true, force: true });
+  console.log('✓ subagent fork mirrors dropped; guardian + legacy spawns kept');
+}
+
+{
+  // `thread_settings_applied` is thread-level and fires BETWEEN turns, so it
+  // can carry a default that disagrees with the turn actually running — 116 of
+  // 477 such events disagree in real ~/.codex data. It must only fill in for
+  // records that precede any turn_context, never override it: gpt-5.6-terra
+  // billed as gpt-5.6-sol is a 2x error (input 2.5/output 15 vs 5/30).
+  const dir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-model-'));
+  const file = join(dir, 'model-precedence.jsonl');
+  const tc = (ts, input) =>
+    JSON.stringify({
+      timestamp: ts,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+          },
+        },
+      },
+    });
+  writeFileSync(
+    file,
+    [
+      JSON.stringify({
+        timestamp: '2026-07-20T09:00:00Z',
+        type: 'session_meta',
+        payload: { id: 'sess-prec', cwd: '/tmp/proj' },
+      }),
+      // Before any turn_context: the fallback is the only model source.
+      JSON.stringify({
+        timestamp: '2026-07-20T09:00:01Z',
+        type: 'event_msg',
+        payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-5.6-sol' } },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-20T09:00:02Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'hi' },
+      }),
+      tc('2026-07-20T09:00:03Z', 1000),
+      // turn_context speaks: it owns the model from here on.
+      JSON.stringify({
+        timestamp: '2026-07-20T09:00:04Z',
+        type: 'turn_context',
+        payload: { turn_id: 't-1', cwd: '/tmp/proj', model: 'gpt-5.6-terra', effort: 'high' },
+      }),
+      tc('2026-07-20T09:00:05Z', 2000),
+      // A stale thread-level default lands mid-turn — must be ignored.
+      JSON.stringify({
+        timestamp: '2026-07-20T09:00:06Z',
+        type: 'event_msg',
+        payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-5.6-sol' } },
+      }),
+      tc('2026-07-20T09:00:07Z', 3000),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  const prec = await parseCodexJsonlFile(file);
+  rmSync(dir, { recursive: true, force: true });
+
+  assert.equal(prec.assistant.length, 3);
+  assert.equal(prec.assistant[0].model, 'gpt-5.6-sol', 'pre-turn_context record uses the fallback');
+  assert.equal(prec.assistant[1].model, 'gpt-5.6-terra', 'turn_context sets the model');
+  assert.equal(
+    prec.assistant[2].model,
+    'gpt-5.6-terra',
+    'a later thread_settings_applied must NOT override turn_context (2x pricing bug)',
+  );
+  console.log('✓ turn_context outranks thread_settings_applied; fallback only before it');
+}
+
+{
+  // Two collateral bugs the fork rollouts exposed:
+  //  1. replayed history re-emits the SOURCE session_meta mid-file — rebinding
+  //     sessionId there stamped the file's tail with the parent's id.
+  //  2. replayed history carries no turn_context, so records before the first
+  //     one fell back to the 'gpt-unknown' placeholder. thread_settings_applied
+  //     carries the real model and lands earlier in the file.
+  const dir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-meta-'));
+  const file = join(dir, 'replayed-meta.jsonl');
+  writeFileSync(
+    file,
+    [
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:00Z',
+        type: 'session_meta',
+        payload: { id: 'own-thread', cwd: '/tmp/proj', cli_version: '0.146.0' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:01Z',
+        type: 'event_msg',
+        payload: {
+          type: 'thread_settings_applied',
+          thread_settings: { model: 'gpt-5.6-sol', service_tier: 'priority' },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:02Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'hello' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:03Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 1000,
+              cached_input_tokens: 0,
+              output_tokens: 100,
+              reasoning_output_tokens: 0,
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:04Z',
+        type: 'session_meta',
+        payload: { id: 'PARENT-thread', cwd: '/tmp/other', timestamp: '2026-08-01T03:00:00Z' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-01T06:00:05Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 1500,
+              cached_input_tokens: 0,
+              output_tokens: 150,
+              reasoning_output_tokens: 0,
+            },
+          },
+        },
+      }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  const parsedMeta = await parseCodexJsonlFile(file);
+  rmSync(dir, { recursive: true, force: true });
+
+  assert.equal(parsedMeta.assistant.length, 2);
+  for (const rec of parsedMeta.assistant) {
+    assert.equal(rec.sessionId, 'own-thread', 'a replayed session_meta must not rebind sessionId');
+    assert.equal(rec.model, 'gpt-5.6-sol', 'thread_settings_applied supplies the model, not gpt-unknown');
+    assert.equal(rec.cwd, '/tmp/proj', 'a replayed session_meta must not rebind cwd');
+  }
+  console.log('✓ replayed session_meta ignored; thread_settings_applied resolves the model');
+}
+
 // --- ccusage parity: cost math (reasoning not billed) + fast/priority tier ---
 {
   const codexPricing = resolveCodexPricing('gpt-5.3-codex').pricing;
@@ -294,47 +641,86 @@ assert.ok(rangeToDates('7d').from instanceof Date);
 }
 
 {
-  // Ported verbatim from ccusage's speed.rs unit tests.
+  // Pure parser, ported from ccusage's `codex_config_requests_fast_service_tier`.
   assert.equal(codexConfigRequestsFastTier('service_tier = "fast"'), true, 'explicit fast');
   assert.equal(codexConfigRequestsFastTier("service_tier = 'priority' # use higher tier"), true, 'priority with comment');
   assert.equal(codexConfigRequestsFastTier('service_tier_override = "fast"'), false, 'override key must not match');
   assert.equal(codexConfigRequestsFastTier('service_tier = "breakfast"'), false, 'substring must not match');
   assert.equal(codexConfigRequestsFastTier('service_tier = "standard"'), false, 'standard is not fast');
-  console.log('✓ service_tier detection matches ccusage (fast/priority only)');
+  assert.equal(codexConfigRequestsFastTier('service_tier = "default"'), false, 'default is not fast');
+  console.log('✓ service_tier parser matches ccusage (fast/priority only)');
 }
 
 {
-  const dir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-home-'));
-  writeFileSync(join(dir, 'config.toml'), 'model = "gpt-5"\nservice_tier = "fast"\n', 'utf8');
-  const prevHome = process.env.CODEX_HOME;
-  process.env.CODEX_HOME = dir;
-  __resetCodexFastTierCacheForTest();
-  assert.equal(detectCodexFastTier(), true, 'detects fast tier from CODEX_HOME/config.toml');
+  // detectCodexFastTier reads config.toml on EVERY call — no module-level cache.
+  // Toggle the file mid-test and confirm the next call picks up the new value.
+  // Override BOTH CODEX_HOME and HOME so the real ~/.codex/config.toml can't
+  // shadow our tmp config (codexHomePaths() ORs the two sources).
+  const rootDir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-tier-'));
+  const codexDir = join(rootDir, '.codex');
+  (await import('node:fs')).mkdirSync(codexDir);
+  const cfg = join(codexDir, 'config.toml');
+  const prevCodexHome = process.env.CODEX_HOME;
+  const prevHome = process.env.HOME;
+  process.env.CODEX_HOME = codexDir;
+  process.env.HOME = rootDir;
+  try {
+    writeFileSync(cfg, 'model = "gpt-5"\nservice_tier = "fast"\n', 'utf8');
+    assert.equal(detectCodexFastTier(), true, 'reads fast from config.toml');
+    writeFileSync(cfg, 'model = "gpt-5"\nservice_tier = "default"\n', 'utf8');
+    assert.equal(detectCodexFastTier(), false, 'live re-reads after edit to default');
+    writeFileSync(cfg, 'model = "gpt-5"\nservice_tier = "priority"\n', 'utf8');
+    assert.equal(detectCodexFastTier(), true, 'live re-reads after edit to priority');
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+  console.log('✓ detectCodexFastTier has no boot cache (live config.toml reads)');
+}
+
+{
   // Per-model multipliers ported from ccusage's fast-multiplier-overrides.json.
-  assert.equal(codexFastMultiplier('gpt-5.5'), 2.5, 'gpt-5.5 fast multiplier = 2.5');
-  assert.equal(codexFastMultiplier('gpt-5.4'), 2, 'gpt-5.4 fast multiplier = 2');
-  assert.equal(codexFastMultiplier('gpt-5.3-codex'), 2, 'gpt-5.3-codex fast multiplier = 2');
-  assert.equal(codexFastMultiplier('gpt-5'), 2, 'unlisted model defaults to 2');
-  assert.equal(codexFastMultiplier('openai/gpt-5.5-20260101'), 2.5, 'prefix/date normalized to gpt-5.5');
-  // gpt-5.5 on the fast tier bills at 2.5x: 1M output @ $30/M → $75.
-  const p55 = resolveCodexPricing('gpt-5.5').pricing;
-  const fast55 = costFromUsage(
-    {
-      input_tokens: 0,
-      output_tokens: 1_000_000,
-      cache_read_input_tokens: 0,
-      cache_creation_input_tokens: 0,
-      cache_creation_5m: 0,
-      cache_creation_1h: 0,
-    },
-    scaleCodexPricing(p55, codexFastMultiplier('gpt-5.5')),
-  );
-  assert.equal(fast55.total.toFixed(2), '75.00', 'gpt-5.5 fast: 1M output @ $30/M x2.5 = $75');
-  if (prevHome === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = prevHome;
-  __resetCodexFastTierCacheForTest();
-  rmSync(dir, { recursive: true, force: true });
-  console.log('✓ per-model fast multipliers match ccusage (gpt-5.5 → 2.5x, default → 2x)');
+  // Wire up a fast-tier CODEX_HOME *and* HOME so codexFastMultiplier returns > 1
+  // even when the dev's real ~/.codex/config.toml says default.
+  const rootDir = mkdtempSync(join(tmpdir(), 'ccgauge-codex-mult-'));
+  const codexDir = join(rootDir, '.codex');
+  (await import('node:fs')).mkdirSync(codexDir);
+  writeFileSync(join(codexDir, 'config.toml'), 'model = "gpt-5"\nservice_tier = "fast"\n', 'utf8');
+  const prevCodexHome = process.env.CODEX_HOME;
+  const prevHome = process.env.HOME;
+  process.env.CODEX_HOME = codexDir;
+  process.env.HOME = rootDir;
+  try {
+    assert.equal(codexFastMultiplier('gpt-5.5'), 2.5, 'gpt-5.5 → 2.5');
+    assert.equal(codexFastMultiplier('gpt-5.4'), 2, 'gpt-5.4 → 2');
+    assert.equal(codexFastMultiplier('gpt-5.3-codex'), 2, 'gpt-5.3-codex → 2');
+    assert.equal(codexFastMultiplier('gpt-5'), 2, 'unlisted model → default 2');
+    assert.equal(codexFastMultiplier('openai/gpt-5.5-20260101'), 2.5, 'prefix/date normalized to gpt-5.5');
+    // 1M output × $30/M × 2.5 = $75
+    const p55 = resolveCodexPricing('gpt-5.5').pricing;
+    const fast55 = costFromUsage(
+      {
+        input_tokens: 0,
+        output_tokens: 1_000_000,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_creation_5m: 0,
+        cache_creation_1h: 0,
+      },
+      scaleCodexPricing(p55, codexFastMultiplier('gpt-5.5')),
+    );
+    assert.equal(fast55.total.toFixed(2), '75.00', 'gpt-5.5 fast: 1M output @ $30/M x2.5 = $75');
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+  console.log('✓ per-model fast multipliers gated by global service_tier=fast|priority');
 }
 
 console.log('\nAll codex parser + pricing assertions passed.');
