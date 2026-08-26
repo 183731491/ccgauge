@@ -43,6 +43,10 @@ export interface ProviderAdapter {
   parseFile(file: string): Promise<ParsedFile>;
 
   resolvePricing(model: string): PricingResolution;
+  // Time-aware pricing (e.g. cc-switch-proxied DeepSeek peak/off-peak). Optional:
+  // providers that bill by time-of-day override this and receive the record's
+  // timestamp; the default is `resolvePricing` (model-only). Absent by default.
+  resolvePricingAt?(model: string, timestamp?: string): PricingResolution;
   shortenModel(model: string): string;
   // `model` lets a provider apply model-specific cost adjustments (e.g. Codex's
   // per-model fast/priority-tier multiplier). Providers that don't need it ignore it.

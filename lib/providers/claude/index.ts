@@ -10,21 +10,29 @@ import type { ProviderAdapter, PricingResolution } from '../types';
 // ===== 自定义模型定价（cc-switch 代理的第三方模型）=====
 // 汇率：1 USD = 7.2 CNY
 // 注意：ccgauge 的 Pricing 单位是 USD per 1M tokens
+// DeepSeek 按官方高峰时段价计（空闲时段半价，暂不支持）；cacheRead=缓存命中价，input/cacheCreation=缓存未命中价
 
 const CUSTOM_PRICING: Record<string, { input: number; output: number; cacheCreation5m: number; cacheCreation1h: number; cacheRead: number }> = {
   'deepseek-v4-pro': {
-    input: 0.4167,
-    output: 0.8333,
-    cacheCreation5m: 0.4167,
-    cacheCreation1h: 0.4167,
-    cacheRead: 0.0035,
+    input: 1.25,
+    output: 3.75,
+    cacheCreation5m: 1.25,
+    cacheCreation1h: 1.25,
+    cacheRead: 0.0417,
   },
   'deepseek-v4-flash': {
-    input: 0.1389,
-    output: 0.2778,
-    cacheCreation5m: 0.1389,
-    cacheCreation1h: 0.1389,
-    cacheRead: 0.0028,
+    input: 0.4167,
+    output: 1.25,
+    cacheCreation5m: 0.4167,
+    cacheCreation1h: 0.4167,
+    cacheRead: 0.0139,
+  },
+  'deepseek-v4-flash-vision-exp': {
+    input: 0.4167,
+    output: 1.25,
+    cacheCreation5m: 0.4167,
+    cacheCreation1h: 0.4167,
+    cacheRead: 0.0139,
   },
   'kimi-for-coding': {
     input: 0, output: 0, cacheCreation5m: 0, cacheCreation1h: 0, cacheRead: 0,
@@ -113,6 +121,59 @@ function resolvePricing(model: string): PricingResolution {
   return { pricing: null, matchType: 'none', matchedKey: null };
 }
 
+// ===== 峰谷计费（DeepSeek 官方：空闲时段为高峰价半价）=====
+// 高峰 = 北京时间周一至周五 09:00–12:00、14:00–18:00；其余（含周末）为空闲/半价。
+// 仅对 cc-switch 代理的 deepseek-v4 系列启用；Kimi 等其余自定义模型照旧走 resolvePricing。
+const PEAK_OFF_MODELS = new Set([
+  'deepseek-v4-pro',
+  'deepseek-v4-flash',
+  'deepseek-v4-flash-vision-exp',
+]);
+
+function customDeepseekKey(model: string): string | null {
+  if (PEAK_OFF_MODELS.has(model)) return model;
+  const stripped = model.replace(dateSuffix, '');
+  return PEAK_OFF_MODELS.has(stripped) ? stripped : null;
+}
+
+// 记录时间戳为 ISO-UTC（Claude Code 带 Z/offset），经 Intl 转为北京时间判峰谷。
+// 无法解析 → 返回 true（高峰，保守）。周末总是空闲（周五 18:00 后至周一 09:00 前均空闲）。
+function isBeijingPeak(iso: string): boolean {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return true;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai',
+    weekday: 'short',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(d);
+  const wd = parts.find((p) => p.type === 'weekday')?.value ?? '';
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value);
+  if (wd === 'Sat' || wd === 'Sun') return false;
+  return (hour >= 9 && hour < 12) || (hour >= 14 && hour < 18);
+}
+
+function resolvePricingAt(model: string, timestamp?: string): PricingResolution {
+  const key = customDeepseekKey(model);
+  if (!key || !timestamp) return resolvePricing(model);
+  if (isBeijingPeak(timestamp)) return resolvePricing(model);
+  const peak = CUSTOM_PRICING[key];
+  if (!peak) return resolvePricing(model);
+  const half = (v: number) => v / 2;
+  const matchType = model === key ? 'exact' : 'date-stripped';
+  return {
+    pricing: {
+      input: half(peak.input),
+      output: half(peak.output),
+      cacheCreation5m: half(peak.cacheCreation5m),
+      cacheCreation1h: half(peak.cacheCreation1h),
+      cacheRead: half(peak.cacheRead),
+    },
+    matchType,
+    matchedKey: key,
+  };
+}
+
 function getDirs(): string[] {
   const home = os.homedir();
   const candidates = [
@@ -148,6 +209,7 @@ export const claudeAdapter: ProviderAdapter = {
     return parsed;
   },
   resolvePricing,
+  resolvePricingAt,
   shortenModel: shortenClaudeModel,
   costFromUsage,
   costFootnoteKey: null,

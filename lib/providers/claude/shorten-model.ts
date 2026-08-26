@@ -9,6 +9,7 @@ export function shortenClaudeModel(model: string): string {
   const CUSTOM_NAMES: Record<string, string> = {
     'deepseek-v4-pro': 'DeepSeek V4 Pro',
     'deepseek-v4-flash': 'DeepSeek V4 Flash',
+    'deepseek-v4-flash-vision-exp': 'DeepSeek V4 Flash Vision Experimental',
     'kimi-for-coding': 'Kimi K2.5',
     'k2p6': 'Kimi K2.6',
   };
